@@ -1031,7 +1031,7 @@ class CommProtocol:
             response_slot = slot_id
         else:  # Embroidery
             space = self.machine_state.card_embroidery
-            slot_id = self._next_free_card_slot(space)
+            slot_id = 0 # self._next_free_card_slot(space)
             max_slot_id = self.CARD_MAX_SLOT_EMBROIDERY
             response_code = 0xC0
             response_slot = slot_id + 0xC8
