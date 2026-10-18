@@ -1258,6 +1258,20 @@ class CommProtocol:
         except Exception:
             filename = ""
 
+        # Experimental: dump the raw stitch-pattern bytes to disk for offline analysis.
+        # The file is named after the payload's filename field (null-terminated) + .bin.
+        try:
+            dump_dir = r"c:\temp\emb_re\out"
+            os.makedirs(dump_dir, exist_ok=True)
+            dump_name = filename_bytes.rstrip(b'\x00').decode('latin-1', errors='replace')
+            dump_name = os.path.basename(dump_name) or "unnamed"
+            dump_path = os.path.join(dump_dir, dump_name + ".bin")
+            with open(dump_path, "wb") as f:
+                f.write(pattern_bytes)
+            logger.info(f"Write Card: dumped {len(pattern_bytes)} pattern bytes to {dump_path}")
+        except OSError as e:
+            logger.warning(f"Write Card: could not dump pattern bytes to {dump_dir!r}: {e}")
+
         slot = CardMemorySlot(
             pattern_type = self._write_card_stitch_type,
             header_raw   = self._write_card_header_raw.hex(),
