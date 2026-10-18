@@ -11,17 +11,40 @@ from machine_state import MachineState
 
 class PatternPreview(QFrame):
     """Widget to display pattern preview as a horizontal rectangle"""
-    
-    def __init__(self, pattern_xy, pattern_type="", show_points=False):
+
+    def __init__(self, pattern_xy, pattern_type="", show_points=False,
+                 canvas_size=None, plot_xy=None):
         super().__init__()
         self.pattern_xy = pattern_xy
         self.pattern_type = pattern_type
         self.show_points = show_points
         self.selected_point = None
         self.show_canvas = False
+        # Optional canvas boundary override (width, height) in canvas units, for
+        # callers whose pattern type is not one of the built-in canvases below.
+        self.canvas_size = canvas_size
+        # Whether pattern_xy holds interleaved coordinates rather than raw bytes.
+        # None keeps the default: only the P-Memory pattern types are known.
+        self.plot_xy = plot_xy
         self.setFixedHeight(45)
         self.setStyleSheet("border: 1px solid #ccc; background-color: white;")
         self.setMinimumWidth(100)
+
+    def _draws_xy_path(self):
+        """True when pattern_xy should be drawn as a stitch path."""
+        if self.plot_xy is not None:
+            return self.plot_xy
+        return self.pattern_type in ("9mm", "MAXI")
+
+    def _canvas_bounds(self):
+        """Canvas extent (width, height) in canvas units, or None if not known."""
+        if self.canvas_size is not None:
+            return self.canvas_size
+        if self.pattern_type == "9mm":
+            return (198, 54)
+        if self.pattern_type == "MAXI":
+            return (999, 360)
+        return None
     
     def paintEvent(self, event):
         """Paint the pattern preview"""
@@ -38,19 +61,16 @@ class PatternPreview(QFrame):
         height = rect.height()
         padding = 4
 
-        if self.pattern_type in ("9mm", "MAXI") and len(self.pattern_xy) >= 2:
+        if self._draws_xy_path() and len(self.pattern_xy) >= 2:
             # Interpret flat list as interleaved x, y coordinates
             xs = self.pattern_xy[0::2]
             ys = self.pattern_xy[1::2]
             n = min(len(xs), len(ys))
             if n >= 2:
-                if self.show_canvas and self.pattern_type in ("9mm", "MAXI"):
-                    if self.pattern_type == "9mm":
-                        x_min, x_max = 0, 198
-                        y_min, y_max = 0, 54
-                    else:
-                        x_min, x_max = 0, 998
-                        y_min, y_max = 0, 359
+                canvas = self._canvas_bounds()
+                if self.show_canvas and canvas is not None:
+                    x_min, x_max = 0, canvas[0]
+                    y_min, y_max = 0, canvas[1]
                 else:
                     x_min, x_max = min(xs), max(xs)
                     y_min, y_max = min(ys), max(ys)
