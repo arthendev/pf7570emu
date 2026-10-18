@@ -14,8 +14,9 @@ from PyQt5.QtWidgets import QShortcut
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtGui import QFont, QColor
 
-from machine_state import MemorySlot
+from machine_state import MemorySlot, EMBROIDERY_CANVAS_SMALL
 from pmemory_tab import PatternPreview
+from preview_render import CardPreviewImage
 
 
 class ClickableLabel(QLabel):
@@ -99,12 +100,30 @@ class CardSlotDetailWindow(QDialog):
 
         layout.addLayout(info_layout)
 
-        # Pattern preview (reuse PatternPreview for now)
+        # Pattern preview: the stitch path decoded from the slot payload, plus
+        # the small preview bitmap the card stores alongside it (Embroidery
+        # slots carry one too, and it is often the only readable information).
         preview_group = QGroupBox("Pattern Preview")
-        preview_layout = QVBoxLayout()
-        self._preview = PatternPreview([], "", show_points=True)
-        self._preview.setFixedHeight(120)
-        preview_layout.addWidget(self._preview)
+        preview_layout = QHBoxLayout()
+        preview_layout.setSpacing(8)
+
+        self._preview = PatternPreview([], "", show_points=True, plot_xy=True)
+        self._preview.setFixedHeight(160)
+        preview_layout.addWidget(self._preview, 1)
+
+        bitmap_column = QVBoxLayout()
+        bitmap_column.setSpacing(3)
+        self._card_preview = CardPreviewImage(160)
+        bitmap_column.addWidget(self._card_preview, 0, Qt.AlignTop | Qt.AlignHCenter)
+        self._card_preview_label = QLabel("Card preview: --")
+        tiny_font = QFont()
+        tiny_font.setPointSize(8)
+        self._card_preview_label.setFont(tiny_font)
+        self._card_preview_label.setAlignment(Qt.AlignCenter)
+        bitmap_column.addWidget(self._card_preview_label)
+        bitmap_column.addStretch(1)
+        preview_layout.addLayout(bitmap_column, 0)
+
         preview_group.setLayout(preview_layout)
         layout.addWidget(preview_group)
 
@@ -810,19 +829,43 @@ class CardSlotDetailWindow(QDialog):
         self._type_label.setText(f"    Type:  {self.slot.pattern_type}")
         self._bytes_label.setText(f"    Bytes:  {self.slot.get_size_bytes()}")
         self._stitches_label.setText(f"    Stitches:  {self.slot.get_size_stitches()}")
-        # Ensure pattern_xy is available for preview: decode 9mm and MAXI patterns when needed
+        # Ensure pattern_xy is available for preview: decode every supported
+        # pattern type (9mm / MAXI / Embroidery) when needed
         ptype = self.slot.pattern_type
-        if ptype in ("9mm", "MAXI"):
+        if ptype in ("9mm", "MAXI", "Embroidery"):
             self.slot.parse_pattern_data()
         self._preview.pattern_xy = list(self.slot.pattern_xy)
         self._preview.pattern_type = self.slot.pattern_type
+        # Embroidery is only ever stored on a card; its canvas comes from the
+        # hoop the design was made for (small hoop is the only one seen so far).
+        self._preview.canvas_size = (EMBROIDERY_CANVAS_SMALL
+                                     if self.slot.pattern_type == "Embroidery"
+                                     else None)
         self._preview.update()
+        self._update_card_preview()
         self._refresh_raw_display()
         self._populate_header_grid()
         self._populate_pattern_grid()
         self._populate_points_grid()
         self._delete_btn.setEnabled(self.slot.pattern_type != "Empty")
         self._update_nav_buttons()
+
+    def _update_card_preview(self):
+        """Show the preview bitmap the card stores next to the stitch payload.
+
+        The bitmap is independent of the stitch decoding, so it still gives a
+        usable preview when the payload itself cannot be parsed.
+        """
+        raw = getattr(self.slot, "preview_raw", "") or ""
+        is_embroidery = self.slot.pattern_type == "Embroidery"
+        self._card_preview.set_preview(raw, self.slot.pattern_type, is_embroidery)
+
+        if not raw:
+            self._card_preview_label.setText("Card preview: none")
+        elif self._card_preview.has_preview():
+            self._card_preview_label.setText(f"Card preview ({len(raw) // 2} B)")
+        else:
+            self._card_preview_label.setText("Card preview: undecodable")
 
     def _format_header_raw(self, raw: str) -> str:
         if not self._logical_split_cb.isChecked() or not raw:

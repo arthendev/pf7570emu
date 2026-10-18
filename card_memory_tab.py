@@ -7,10 +7,11 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QCheckBox, QSpinBox, QPushButton, QFileDialog,
                              QInputDialog, QMessageBox)
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QFont, QColor, QImage, QPixmap, QPainter, QTransform
+from PyQt5.QtGui import QFont, QPixmap, QPainter
 
 from machine_state import MachineState, CardMemorySpace, CardMemorySlot
 from pmemory_tab import PatternPreview
+from preview_render import decode_card_preview
 
 
 class CardPreviewWidget(QWidget):
@@ -39,38 +40,8 @@ class CardPreviewWidget(QWidget):
         self.setStyleSheet("border: 1px solid #ccc; background-color: white;")
 
     def _build_pixmap(self, preview_raw: str, pattern_type: str, is_embroidery: bool):
-        if not preview_raw:
-            return None
-        try:
-            data = bytes.fromhex(preview_raw)
-        except ValueError:
-            return None
-
-        col_height = 24 if pattern_type == "9mm" else 48
-        bytes_per_col = col_height // 8  # 3 for 9mm, 6 for MAXI/Embroidery
-
-        if len(data) < bytes_per_col:
-            return None
-
-        num_cols = len(data) // bytes_per_col
-        img = QImage(num_cols, col_height, QImage.Format_RGB32)
-        img.fill(QColor(255, 255, 255).rgb())
-        black = QColor(0, 0, 0).rgb()
-
-        for col in range(num_cols):
-            for byte_idx in range(bytes_per_col):
-                byte_val = data[col * bytes_per_col + byte_idx]
-                # byte_idx=0 is the bottom-most 8-pixel group; last byte_idx is the top group
-                y_base = col_height - 8 - byte_idx * 8
-                for bit in range(8):
-                    # MSB (bit 7) is the topmost pixel of this 8-pixel segment
-                    if (byte_val >> (7 - bit)) & 1:
-                        img.setPixel(col, y_base + bit, black)
-
-        if is_embroidery:
-            img = img.transformed(QTransform().rotate(180))
-
-        return QPixmap.fromImage(img)
+        image = decode_card_preview(preview_raw, pattern_type, is_embroidery)
+        return QPixmap.fromImage(image) if image is not None else None
 
     def paintEvent(self, event):
         if not self._display_pixmap:
@@ -131,7 +102,9 @@ class CardSlotWidget(QFrame):
                 self.slot.preview_raw, self.slot.pattern_type, self._is_embroidery
             )
         else:
-            preview = PatternPreview(self.slot.pattern_xy, self.slot.pattern_type)
+            # Card slots always decode pattern_xy into coordinates.
+            preview = PatternPreview(self.slot.pattern_xy, self.slot.pattern_type,
+                                     plot_xy=True)
         right_layout.addWidget(preview)
 
         main_layout.addLayout(right_layout)

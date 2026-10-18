@@ -335,6 +335,188 @@ class MemorySlot:
         return slot
 
 
+# ---------------------------------------------------------------------------
+# Embroidery (small / large hoop) on-card payload
+# ---------------------------------------------------------------------------
+# The bytes PC-Designer stores in an "Embroidery" card slot are the exact byte
+# stream it sends to the machine, so the transfer format applies unchanged (see
+# reverse_engineering/ENCODING.md for the derivation from 243 captured transfers):
+#
+#   off  0..3   preamble            80 28 05 00
+#   off  4..5   u16 LE  V(max canvas y)     (payload axis 0 is fed by canvas y)
+#   off  6..7   u16 LE  V(max canvas x)     (payload axis 1 is fed by canvas x)
+#   off  8..10  marker              80 80 2E
+#   off 11..12  u16 BE  value of the first point, axis 0
+#   off 13..14  u16 BE  value of the first point, axis 1
+#   off 15..16  marker              30 80
+#   off 17..    body: one record per step
+#   last 3      trailer             80 2F 80
+#
+# A "value" is not a position but the distance from that axis' maximum, already
+# converted to 1/10 mm payload units:
+#
+#   V(i) = trunc(EMBROIDERY_SCALE * (max - coordinate_i))
+#
+# Each body record carries the step to the next point, and the values are
+# differenced, so the receiver accumulates them.
+#
+#   small step: 2 bytes, two signed bytes  -> V(i+1) = V(i) + byte
+#   large step: 80 2E <u16 BE> <u16 BE> 80 -> V(i+1) given absolutely
+#
+# The large form is used once a step no longer fits a signed byte, which happens
+# at about 76 canvas units (12.7 mm).  Since small records only ever hold the
+# range -127..127, a leading 0x80 is unambiguously the large form's escape byte.
+EMBROIDERY_PREAMBLE = bytes([0x80, 0x28, 0x05, 0x00])
+EMBROIDERY_MARK_B = bytes([0x30, 0x80])
+EMBROIDERY_LARGE_ESCAPE = 0x80
+EMBROIDERY_LARGE_TAG = 0x2E
+EMBROIDERY_LARGE_SIZE = 7
+EMBROIDERY_TRAILER = bytes([0x80, 0x2F, 0x80])
+EMBROIDERY_HEADER_SIZE = 17
+
+# Colour change.  Instead of dropping to the usual 2-byte step, the record for
+# the point that follows a colour change is upgraded to this group:
+#
+#   80 20                                 colour-change command
+#   80 80 2E <BE16 Vx> <BE16 Vy> 80        the change point's own values
+#   00 00                                  tie-off stitch (zero movement)
+#   80 2E <BE16 Vx> <BE16 Vy> <30+n> 80    the same pair + section counter
+#
+# The values are exactly Vx/Vy of the change point, i.e. the last stitch of the
+# colour section that just ended, so the receiver resyncs instead of adding a
+# step.  The counter byte is 0x30 + section number, matching the header's own
+# 30 80 terminator.  A colour change after the very first point has no record to
+# upgrade and emits only the tie-off.
+EMBROIDERY_COLOUR_MARK = bytes([0x80, 0x20])
+EMBROIDERY_COLOUR_MARK_A = bytes([0x80, 0x80, 0x2E])
+EMBROIDERY_COLOUR_BLOCK_SIZE = 20
+
+# Payload units (1/10 mm) per canvas unit (1/6 mm), solved from the captures.
+# The feasible interval over all 243 transfers is 1.673207 .. 1.673227.
+EMBROIDERY_SCALE = 1.673217
+
+# Canvas dimensions in canvas units (1/6 mm), used for the preview boundary.
+# Small and large hoop designs share the payload format, so a large-hoop slot
+# cannot be recognised from the payload alone.
+EMBROIDERY_CANVAS_SMALL = (480, 480)
+EMBROIDERY_CANVAS_LARGE = (720, 690)     # reference only, not selectable yet
+
+
+def _signed_byte(value: int) -> int:
+    """Interpret a 0..255 byte as a signed value."""
+    return value - 256 if value >= 128 else value
+
+
+def _canvas_units_from_payload(value: int, scale: float = EMBROIDERY_SCALE) -> int:
+    """Invert ``V = trunc(scale * distance)`` and return the canvas distance.
+
+    ``distance`` is a non-negative integer and ``scale`` > 1, so ``trunc`` steps
+    by 1 or 2 and every payload value that the encoder can produce maps back to
+    exactly one distance.  Values that are unreachable (i.e. a corrupt payload)
+    fall back to the nearest candidate.
+    """
+    if value <= 0:
+        return 0
+    guess = int(value / scale)
+    best, best_error = 0, None
+    for candidate in range(max(0, guess - 1), guess + 3):
+        error = abs(int(scale * candidate) - value)
+        if best_error is None or error < best_error:
+            best, best_error = candidate, error
+        if error == 0:
+            break
+    return best
+
+
+def _is_colour_block(body: bytes, index: int) -> bool:
+    """True when the 20-byte colour-change group starts at *index*."""
+    end = index + EMBROIDERY_COLOUR_BLOCK_SIZE
+    if end > len(body) or body[index:index + 2] != EMBROIDERY_COLOUR_MARK:
+        return False
+    block = body[index:end]
+    return (block[2:5] == EMBROIDERY_COLOUR_MARK_A
+            and block[9] == EMBROIDERY_LARGE_ESCAPE
+            and 0x30 <= block[18] <= 0x3F
+            and block[19] == EMBROIDERY_LARGE_ESCAPE)
+
+
+def decode_embroidery_payload(raw_hex: str):
+    """Decode an Embroidery card payload into canvas points.
+
+    Returns ``(pattern_xy, body_bytes, consumed)`` — an interleaved x/y list in
+    canvas units (1/6 mm), the raw step records, and how many body bytes the
+    walk understood.  ``pattern_xy`` is empty when the payload cannot be decoded;
+    ``consumed < len(body_bytes)`` means an unknown record stopped the walk, so
+    the returned geometry is only the leading part of the design.
+    """
+    try:
+        data = bytes.fromhex((raw_hex or "").strip())
+    except (ValueError, AttributeError):
+        return [], b"", 0
+
+    trailer_len = len(EMBROIDERY_TRAILER)
+    if len(data) < EMBROIDERY_HEADER_SIZE + trailer_len:
+        return [], b"", 0
+    if not data.startswith(EMBROIDERY_PREAMBLE):
+        return [], b"", 0
+    if data[EMBROIDERY_HEADER_SIZE - 2:EMBROIDERY_HEADER_SIZE] != EMBROIDERY_MARK_B:
+        return [], b"", 0
+
+    body = data[EMBROIDERY_HEADER_SIZE:len(data) - trailer_len]
+
+    max_y = _canvas_units_from_payload(int.from_bytes(data[4:6], "little"))
+    max_x = _canvas_units_from_payload(int.from_bytes(data[6:8], "little"))
+    axis0 = int.from_bytes(data[11:13], "big")
+    axis1 = int.from_bytes(data[13:15], "big")
+    values = [(axis0, axis1)]
+
+    index = 0
+    while index < len(body):
+        if _is_colour_block(body, index):
+            # Colour change: resync to the values the group carries.
+            axis0 = int.from_bytes(body[index + 5:index + 7], "big")
+            axis1 = int.from_bytes(body[index + 7:index + 9], "big")
+            values.append((axis0, axis1))
+            index += EMBROIDERY_COLOUR_BLOCK_SIZE
+        elif (body[index] == EMBROIDERY_LARGE_ESCAPE
+                and body[index + 1:index + 2] == bytes([EMBROIDERY_LARGE_TAG])
+                and index + EMBROIDERY_LARGE_SIZE <= len(body)):
+            # The large form carries the destination point's values absolutely,
+            # so the accumulator must resync to them (the following small steps
+            # continue from here).
+            axis0 = int.from_bytes(body[index + 2:index + 4], "big")
+            axis1 = int.from_bytes(body[index + 4:index + 6], "big")
+            values.append((axis0, axis1))
+            index += EMBROIDERY_LARGE_SIZE
+        elif body[index] != EMBROIDERY_LARGE_ESCAPE and index + 2 <= len(body):
+            axis0 += _signed_byte(body[index])
+            axis1 += _signed_byte(body[index + 1])
+            values.append((axis0, axis1))
+            index += 2
+        else:
+            # Unknown record shape — stop rather than invent points.
+            break
+
+    xs, ys = [], []
+    for v_axis0, v_axis1 in values:
+        ys.append(max_y - _canvas_units_from_payload(v_axis0))
+        xs.append(max_x - _canvas_units_from_payload(v_axis1))
+
+    # Canvas coordinates are non-negative.  A corrupt header could push a point
+    # below zero, which would break the preview scaling — shift instead.
+    if xs and min(xs) < 0:
+        shift = -min(xs)
+        xs = [x + shift for x in xs]
+    if ys and min(ys) < 0:
+        shift = -min(ys)
+        ys = [y + shift for y in ys]
+
+    pattern_xy: List[int] = []
+    for x, y in zip(xs, ys):
+        pattern_xy.extend([int(x), int(y)])
+    return pattern_xy, body, index
+
+
 @dataclass
 class CardMemorySlot:
     """Represents a single slot on a memory card.
@@ -397,7 +579,8 @@ class CardMemorySlot:
 
         9mm:  groups of 2 bytes — dx (with 0x5B offset) and y absolute
         MAXI: groups of 3 bytes — dy_acc transport (with 0xC6 offset), dx (with 0x5B offset), and y absolute;
-        Embroidery (Small hoop / Large hoop): format unknown, no parsing yet.
+        Embroidery (Small hoop / Large hoop): the on-card payload is the byte stream PC-Designer
+            sends to the machine, decoded by decode_embroidery_payload() into canvas units (1/6 mm).
         """
         pattern_bytes: List[int] = []
         pattern_xy: List[int] = []
@@ -520,6 +703,17 @@ class CardMemorySlot:
                 # interleave into pattern_xy
                 for x, y in zip(xs, ys):
                     pattern_xy.extend([int(x), int(y)])
+
+        elif self.pattern_type == "Embroidery":
+            # Small / large hoop embroidery: decode the card payload into canvas
+            # points so the slot gets the same preview and point list as 9mm/MAXI.
+            pattern_xy, body, consumed = decode_embroidery_payload(self.pattern_raw)
+            pattern_bytes = list(body[:consumed]) if consumed else list(body)
+            # Embroidery carries no side transport, so the xyt columns are 0
+            # (same convention as 9mm).
+            for i in range(0, len(pattern_xy) - 1, 2):
+                pattern_xyt.extend([pattern_xy[i], pattern_xy[i + 1], 0])
+                pattern_xytacc.extend([pattern_xy[i], pattern_xy[i + 1], 0])
 
         self.pattern_bytes = pattern_bytes
         self.pattern_xy = pattern_xy
