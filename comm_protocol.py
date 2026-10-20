@@ -200,8 +200,8 @@ class CommProtocol:
         return self.machine_state.supports_card and self.machine_state.card_inserted
 
     def _card_disabled_response(self) -> bytes:
-        """Return the bytes to send when card operations are disabled (CTRL_NAK + CTRL_BS)."""
-        return bytes([self.CTRL_NAK, self.CTRL_BS])
+        """Return the bytes to send when card operations are disabled (CTRL_NAK + CARD_RESPONSE_NO_CARD_INSERTED)."""
+        return bytes([self.CTRL_NAK, self.CARD_RESPONSE_NO_CARD_INSERTED])
 
     def process_incoming(self, data: bytes) -> bytes:
         """
