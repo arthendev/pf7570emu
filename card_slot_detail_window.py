@@ -8,15 +8,202 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QTextEdit, QGroupBox, QTabWidget, QWidget,
                              QScrollArea, QGridLayout, QSizePolicy, QSpacerItem,
                              QTableWidget, QTableWidgetItem, QMenu, QApplication,
-                             QCheckBox)
+                             QCheckBox, QFrame)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import QShortcut
 from PyQt5.QtGui import QKeySequence
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtGui import QFont, QColor, QPainter, QPen, QBrush
 
 from machine_state import MemorySlot, EMBROIDERY_CANVAS_SMALL
 from pmemory_tab import PatternPreview
 from preview_render import CardPreviewImage, split_preview_blocks
+
+
+# Predefined 16-colour palette for the thread-colour preview.  The card payload
+# records where the colour sections start but carries no RGB values, so sections
+# are drawn in order from this palette (cycled when a design has more colours).
+# The first entry matches the single-colour preview pen, so a design that carries
+# no usable boundary still looks like the usual preview.
+CARD_COLOR_PALETTE = [
+    QColor(0, 0, 180),      # 1  blue (default preview pen)
+    QColor(220, 0, 0),      # 2  red
+    QColor(0, 150, 0),      # 3  green
+    QColor(230, 140, 0),    # 4  orange
+    QColor(150, 0, 180),    # 5  purple
+    QColor(0, 160, 160),    # 6  teal
+    QColor(210, 0, 140),    # 7  magenta
+    QColor(130, 90, 0),     # 8  brown
+    QColor(100, 100, 100),  # 9  grey
+    QColor(0, 120, 210),    # 10 azure
+    QColor(120, 200, 0),    # 11 lime
+    QColor(255, 150, 190),  # 12 pink
+    QColor(0, 200, 140),    # 13 mint
+    QColor(160, 120, 255),  # 14 violet
+    QColor(0, 70, 130),     # 15 navy
+    QColor(0, 0, 0),        # 16 black
+]
+
+
+class CardPatternPreview(PatternPreview):
+    """Stitch-path preview that colours each thread-colour section.
+
+    The shared ``PatternPreview`` used by P-Memory stays single-colour on
+    purpose: 9mm and MAXI patterns never carry colour changes.  Card slots do
+    (Embroidery), so the colour handling lives here instead of leaking into the
+    shared widget.
+    """
+
+    def __init__(self, pattern_xy, pattern_type="", show_points=False,
+                 canvas_size=None, plot_xy=None):
+        super().__init__(pattern_xy, pattern_type, show_points,
+                         canvas_size, plot_xy)
+        # Point index at which each new thread colour section starts, and the
+        # QColor to draw each section with (cycled past the palette size).
+        self.color_change_points = []
+        self.color_palette = []
+
+    def _section_indices(self, n):
+        """Return the thread-colour section number of each point, or None.
+
+        ``color_change_points`` holds the point index at which each new section
+        starts, so point *i* already uses the new section when a boundary sits at
+        *i*.  Returns None when the slot carries no palette / no sections, which
+        keeps the shared single-colour rendering.
+        """
+        palette = list(self.color_palette or [])
+        if not palette or n < 1:
+            return None
+        boundaries = sorted(self.color_change_points or [])
+        sections = []
+        section = 0
+        boundary_idx = 0
+        for i in range(n):
+            while boundary_idx < len(boundaries) and boundaries[boundary_idx] <= i:
+                section += 1
+                boundary_idx += 1
+            sections.append(section)
+        return sections
+
+    def _segment_colors(self, n):
+        """Return one QColor per stitch segment, or None for the default pen.
+
+        Segment *i* runs from point *i* to point *i + 1*, so it is drawn with the
+        colour of the section that point *i* belongs to.  The palette is cycled
+        when a design has more sections than palette entries.
+        """
+        sections = self._section_indices(n)
+        if sections is None or n < 2:
+            return None
+        palette = list(self.color_palette)
+        return [palette[sections[i] % len(palette)] for i in range(n - 1)]
+
+    def paintEvent(self, event):
+        """Paint the pattern preview, colouring thread-colour sections."""
+        if not self._draws_xy_path():
+            # Byte-intensity fallback comes straight from the shared widget.
+            super().paintEvent(event)
+            return
+
+        QFrame.paintEvent(self, event)
+
+        if not self.pattern_xy or len(self.pattern_xy) < 2:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        width = self.width()
+        height = self.height()
+        padding = 4
+
+        xs = self.pattern_xy[0::2]
+        ys = self.pattern_xy[1::2]
+        n = min(len(xs), len(ys))
+        if n < 2:
+            painter.end()
+            return
+
+        canvas = self._canvas_bounds()
+        if self.show_canvas and canvas is not None:
+            x_min, x_max = 0, canvas[0]
+            y_min, y_max = 0, canvas[1]
+        else:
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+        x_range = x_max - x_min or 1
+        y_range = y_max - y_min or 1
+
+        draw_w = width - 2 * padding
+        draw_h = height - 2 * padding
+        scale = min(draw_w / x_range, draw_h / y_range)
+        x_offset = padding + (draw_w - x_range * scale) / 2
+        y_offset = padding + (draw_h - y_range * scale) / 2
+
+        def to_screen(xi, yi):
+            sx = x_offset + (xi - x_min) * scale
+            sy = height - y_offset - (yi - y_min) * scale
+            return int(sx), int(sy)
+
+        # Canvas boundary rectangle
+        if self.show_canvas:
+            cx1, cy1 = to_screen(x_min, y_min)
+            cx2, cy2 = to_screen(x_max, y_max)
+            painter.setPen(QPen(QColor(180, 180, 180), 1, Qt.DashLine))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(
+                min(cx1, cx2), min(cy1, cy2),
+                abs(cx2 - cx1), abs(cy2 - cy1)
+            )
+
+        # Stitch path: one pen per thread-colour section, or the shared widget's
+        # default blue when the design carries no colour change.
+        segment_colors = self._segment_colors(n)
+        default_pen = QPen(QColor(0, 0, 180), 1)
+        for i in range(n - 1):
+            painter.setPen(QPen(segment_colors[i], 1) if segment_colors
+                           else default_pen)
+            x1, y1 = to_screen(xs[i], ys[i])
+            x2, y2 = to_screen(xs[i + 1], ys[i + 1])
+            painter.drawLine(x1, y1, x2, y2)
+
+        # Intermediate points as small dots — coloured per section, so a dense
+        # design shows its thread colours instead of a black blob.
+        if self.show_points:
+            sections = self._section_indices(n)
+            palette = list(self.color_palette or [])
+            painter.setPen(Qt.NoPen)
+            for i in range(1, n - 1):
+                if sections is not None:
+                    painter.setBrush(QBrush(palette[sections[i] % len(palette)]))
+                else:
+                    painter.setBrush(QBrush(QColor(0, 0, 0)))
+                cx, cy = to_screen(xs[i], ys[i])
+                painter.drawEllipse(cx - 2, cy - 2, 4, 4)
+
+        # Selected point: always visible, even when show_points is off
+        if self.selected_point is not None:
+            sel = self.selected_point
+            if 0 <= sel < n:
+                sx, sy = to_screen(xs[sel], ys[sel])
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(0, 0, 0)))
+                size = 6
+                painter.drawRect(sx - size // 2, sy - size // 2, size, size)
+
+        # First point — green (drawn on top)
+        if self.show_points:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(0, 180, 0)))
+            cx, cy = to_screen(xs[0], ys[0])
+            painter.drawEllipse(cx - 3, cy - 3, 6, 6)
+
+        # Last point — red (drawn on top)
+        if self.show_points:
+            painter.setBrush(QBrush(QColor(200, 0, 0)))
+            cx, cy = to_screen(xs[n - 1], ys[n - 1])
+            painter.drawEllipse(cx - 3, cy - 3, 6, 6)
+
+        painter.end()
 
 
 class ClickableLabel(QLabel):
@@ -111,7 +298,7 @@ class CardSlotDetailWindow(QDialog):
         preview_layout = QHBoxLayout()
         preview_layout.setSpacing(8)
 
-        self._preview = PatternPreview([], "", show_points=True, plot_xy=True)
+        self._preview = CardPatternPreview([], "", show_points=True, plot_xy=True)
         self._preview.setFixedHeight(160)
         preview_layout.addWidget(self._preview, 1)
 
@@ -869,6 +1056,12 @@ class CardSlotDetailWindow(QDialog):
             self.slot.parse_pattern_data()
         self._preview.pattern_xy = list(self.slot.pattern_xy)
         self._preview.pattern_type = self.slot.pattern_type
+        # Thread-colour sections come from the decoded payload (Embroidery only);
+        # other pattern types stay single-colour and keep the default preview pen.
+        colour_starts = list(
+            getattr(self.slot, "color_change_points", None) or [])
+        self._preview.color_change_points = colour_starts
+        self._preview.color_palette = CARD_COLOR_PALETTE if colour_starts else []
         # Embroidery is only ever stored on a card; its canvas comes from the
         # hoop the design was made for (small hoop is the only one seen so far).
         self._preview.canvas_size = (EMBROIDERY_CANVAS_SMALL

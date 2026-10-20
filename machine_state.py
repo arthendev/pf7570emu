@@ -338,9 +338,8 @@ class MemorySlot:
 # ---------------------------------------------------------------------------
 # Embroidery (small / large hoop) on-card payload
 # ---------------------------------------------------------------------------
-# The bytes PC-Designer stores in an "Embroidery" card slot are the exact byte
-# stream it sends to the machine, so the transfer format applies unchanged (see
-# reverse_engineering/ENCODING.md for the derivation from 243 captured transfers):
+# The bytes PCD stores in an "Embroidery" card slot are the exact byte
+# stream it sends to the machine, so the transfer format applies unchanged:
 #
 #   off  0..3   preamble            80 28 05 00
 #   off  4..5   u16 LE  V(max canvas y)     (payload axis 0 is fed by canvas y)
@@ -440,7 +439,8 @@ def _is_colour_block(body: bytes, index: int) -> bool:
             and block[19] == EMBROIDERY_LARGE_ESCAPE)
 
 
-def decode_embroidery_payload(raw_hex: str):
+def decode_embroidery_payload(raw_hex: str,
+                              colour_points: Optional[List[int]] = None):
     """Decode an Embroidery card payload into canvas points.
 
     Returns ``(pattern_xy, body_bytes, consumed)`` — an interleaved x/y list in
@@ -448,6 +448,11 @@ def decode_embroidery_payload(raw_hex: str):
     walk understood.  ``pattern_xy`` is empty when the payload cannot be decoded;
     ``consumed < len(body_bytes)`` means an unknown record stopped the walk, so
     the returned geometry is only the leading part of the design.
+
+    When ``colour_points`` is given it is filled with the point index at which
+    each thread colour section starts (the tie-off point that repeats the last
+    stitch of the section that just ended), so callers can colour the preview
+    per section.  A single-colour design leaves it empty.
     """
     try:
         data = bytes.fromhex((raw_hex or "").strip())
@@ -476,6 +481,10 @@ def decode_embroidery_payload(raw_hex: str):
             # Colour change: resync to the values the group carries.
             axis0 = int.from_bytes(body[index + 5:index + 7], "big")
             axis1 = int.from_bytes(body[index + 7:index + 9], "big")
+            if colour_points is not None:
+                # The tie-off point repeats the last stitch of the section that
+                # just ended; the stitches after it use the next thread colour.
+                colour_points.append(len(values))
             values.append((axis0, axis1))
             index += EMBROIDERY_COLOUR_BLOCK_SIZE
         elif (body[index] == EMBROIDERY_LARGE_ESCAPE
@@ -535,6 +544,9 @@ class CardMemorySlot:
     pattern_xy: List[int] = field(default_factory=list)
     pattern_xyt: List[int] = field(default_factory=list)
     pattern_xytacc: List[int] = field(default_factory=list)
+    # Point indices at which a new thread colour starts (Embroidery only).
+    # Derived from pattern_raw by parse_pattern_data(), so not persisted.
+    color_change_points: List[int] = field(default_factory=list)
 
     def clear(self) -> None:
         """Remove this slot from its parent CardMemorySpace (if set) and clear data.
@@ -552,6 +564,7 @@ class CardMemorySlot:
         self.pattern_xy = []
         self.pattern_xyt = []
         self.pattern_xytacc = []
+        self.color_change_points = []
         parent = self._parent
         parent.slots.remove(self)
 
@@ -583,6 +596,7 @@ class CardMemorySlot:
         pattern_xy: List[int] = []
         pattern_xyt: List[int] = []
         pattern_xytacc: List[int] = []
+        color_change_points: List[int] = []
 
         if self.pattern_type == "9mm":
             # Card 9mm encoding: raw is hex bytes. First/last byte may be 0x80/0x8A markers.
@@ -704,7 +718,8 @@ class CardMemorySlot:
         elif self.pattern_type == "Embroidery":
             # Small / large hoop embroidery: decode the card payload into canvas
             # points so the slot gets the same preview and point list as 9mm/MAXI.
-            pattern_xy, body, consumed = decode_embroidery_payload(self.pattern_raw)
+            pattern_xy, body, consumed = decode_embroidery_payload(
+                self.pattern_raw, color_change_points)
             pattern_bytes = list(body[:consumed]) if consumed else list(body)
             # Embroidery carries no side transport, so the xyt columns are 0
             # (same convention as 9mm).
@@ -716,6 +731,7 @@ class CardMemorySlot:
         self.pattern_xy = pattern_xy
         self.pattern_xyt = pattern_xyt
         self.pattern_xytacc = pattern_xytacc
+        self.color_change_points = color_change_points
 
     def get_pattern_stats(self) -> dict:
         """Compute statistics from the pattern data (x,y interleaved).
