@@ -88,11 +88,6 @@ class CommProtocol:
     READ_CHUNK_SIZE_PMEM_MAXI = 350
     READ_CHUNK_SIZE_CARD = 0x80  # 128 bytes per chunk for card read operations (KB and KS)
 
-    # Number of bytes per thread-colour entry in the KN (write card) payload.
-    # The colour block sits between the preview image and the stitch pattern and
-    # holds (colour_count - 1) entries, since the first colour is implicit.
-    CARD_COLOR_ENTRY_SIZE = 0x120
-
     # Card-write error response bytes
     CARD_RESPONSE_COPYRIGHT_PROTECTED = 0x00
     CARD_RESPONSE_WRITE_PROTECTED = 0x04
@@ -161,7 +156,8 @@ class CommProtocol:
         self._write_card_pattern_size = 0
         self._write_card_filename_len = 0
         self._write_card_color_count = 0
-        self._write_card_colors_size = 0
+        self._write_card_preview_count = 0
+        self._write_card_preview_total_size = 0
         self._write_card_slot_id = None
         self._write_card_data_accumulated = bytearray()
         self._write_card_data_substate = self._CARD_CHUNK_WAIT_START
@@ -962,7 +958,8 @@ class CommProtocol:
         self._write_card_pattern_size = 0
         self._write_card_filename_len = 0
         self._write_card_color_count = 0
-        self._write_card_colors_size = 0
+        self._write_card_preview_count = 0
+        self._write_card_preview_total_size = 0
         self._write_card_slot_id = None
         self._write_card_expects_enq = False  # first chunk may omit CTRL_ENQ
         self._state = self._STATE_WRITE_CARD_HEADER
@@ -974,7 +971,7 @@ class CommProtocol:
         Header layout (raw bytes, 0-indexed):
           [6]     stitch type: 0x01=9mm, 0x02=MAXI, 0x03=Embroidery
           [24-25] preview image size in bytes (big-endian uint16)
-          [26]    number of thread colours for the pattern
+          [26]    number of thread colours (one preview bitmap per colour)
           [27-28] pattern data size in bytes (big-endian uint16)
           [29]    filename field length including null-terminator
 
@@ -1008,11 +1005,14 @@ class CommProtocol:
             return bytes([self.CTRL_NAK])
 
         self._write_card_preview_size = (buf[24] << 8) | buf[25]
-        # Thread-colour block length. The header stores the total number of colours;
-        # the first colour is implicit, so (count - 1) entries are transmitted,
-        # each CARD_COLOR_ENTRY_SIZE (0x120) bytes long.
+        # Each thread colour carries one preview bitmap of preview_size bytes:
+        # the main preview first, then one more block per additional colour.
+        # Those additional blocks used to be transmitted as the colours field;
+        # they are now stored together with the main preview in one raw block.
         self._write_card_color_count = buf[26]
-        self._write_card_colors_size = max(0, buf[26] - 1) * self.CARD_COLOR_ENTRY_SIZE
+        self._write_card_preview_count = max(1, self._write_card_color_count)
+        self._write_card_preview_total_size = (
+            self._write_card_preview_size * self._write_card_preview_count)
         self._write_card_pattern_size = (buf[27] << 8) | buf[28]
         self._write_card_filename_len = buf[29]
         self._write_card_header_raw = bytes(buf)
@@ -1051,8 +1051,8 @@ class CommProtocol:
 
         logger.info(
             f"Write Card: {self._write_card_stitch_type} pattern assigned to slot {slot_id}, "
-            f"preview={self._write_card_preview_size} bytes, "
-            f"colors={self._write_card_color_count} ({self._write_card_colors_size} bytes), "
+            f"previews={self._write_card_preview_count} x {self._write_card_preview_size} bytes, "
+            f"colors={self._write_card_color_count}, "
             f"pattern={self._write_card_pattern_size} bytes, "
             f"filename_len={self._write_card_filename_len} - ACK 0x{response_code:02X} 0x{response_slot:02X}"
         )
@@ -1080,7 +1080,8 @@ class CommProtocol:
         self._write_card_pattern_size = 0
         self._write_card_filename_len = 0
         self._write_card_color_count = 0
-        self._write_card_colors_size = 0
+        self._write_card_preview_count = 0
+        self._write_card_preview_total_size = 0
         self._write_card_slot_id = None
         self._write_card_data_accumulated = bytearray()
         self._write_card_data_substate = self._CARD_CHUNK_WAIT_START
@@ -1208,8 +1209,7 @@ class CommProtocol:
         self._write_card_data_accumulated.extend(payload)
         total_expected = (
             self._write_card_filename_len
-            + self._write_card_preview_size
-            + self._write_card_colors_size
+            + self._write_card_preview_total_size
             + self._write_card_pattern_size
         )
         total_received = len(self._write_card_data_accumulated)
@@ -1230,9 +1230,12 @@ class CommProtocol:
 
         Payload layout (lengths from the KN header):
           [0 : fn_len]                              → filename bytes (incl. null terminator)
-          [fn_len : fn_len+prev_size]               → preview image (raw bytes)
-          [.. : ..+colors_size]                     → thread colours (raw bytes)
+          [fn_len : fn_len+prev_total]              → all preview bitmaps (main + per-colour)
           [.. : ..+pat_sz]                          → stitch pattern (raw bytes)
+
+        The preview field holds one bitmap per thread colour, concatenated.  It is
+        kept as a single ``preview_raw`` block; the per-colour blocks are separated
+        again only for display.
 
         All fields are stored as lowercase hex strings in the CardMemorySlot.
         Pattern parsing is deferred — the on-card binary stitch format is not yet known;
@@ -1241,17 +1244,14 @@ class CommProtocol:
         import datetime
         from machine_state import CardMemorySlot
 
-        data     = bytes(self._write_card_data_accumulated)
-        fn_len   = self._write_card_filename_len
-        prev_sz  = self._write_card_preview_size
-        colors_sz = self._write_card_colors_size
-        pat_sz   = self._write_card_pattern_size
+        data        = bytes(self._write_card_data_accumulated)
+        fn_len      = self._write_card_filename_len
+        prev_total  = self._write_card_preview_total_size
+        pat_sz      = self._write_card_pattern_size
 
         filename_bytes = data[:fn_len]
-        preview_bytes  = data[fn_len : fn_len + prev_sz]
-        colors_start   = fn_len + prev_sz
-        colors_bytes   = data[colors_start : colors_start + colors_sz]
-        pattern_bytes  = data[colors_start + colors_sz : colors_start + colors_sz + pat_sz]
+        preview_bytes  = data[fn_len : fn_len + prev_total]
+        pattern_bytes  = data[fn_len + prev_total : fn_len + prev_total + pat_sz]
 
         try:
             filename = filename_bytes.rstrip(b'\x00').decode('latin-1', errors='replace')
@@ -1276,7 +1276,6 @@ class CommProtocol:
             pattern_type = self._write_card_stitch_type,
             header_raw   = self._write_card_header_raw.hex(),
             preview_raw  = preview_bytes.hex(),
-            colors_raw   = colors_bytes.hex(),
             pattern_raw  = pattern_bytes.hex(),
             filename     = filename,
         )
@@ -1295,7 +1294,8 @@ class CommProtocol:
 
         logger.info(
             f"Write Card: committed {self._write_card_stitch_type} slot {self._write_card_slot_id} "
-            f"(filename={filename!r}, preview={prev_sz} B, colors={colors_sz} B, pattern={pat_sz} B)"
+            f"(filename={filename!r}, previews={self._write_card_preview_count} x "
+            f"{self._write_card_preview_size} B, pattern={pat_sz} B)"
         )
         if self.on_card_changed:
             self.on_card_changed()
@@ -1749,6 +1749,30 @@ class CommProtocol:
         self._read_card_preview_data = bytearray()
         self._read_card_preview_offset = 0
 
+    @staticmethod
+    def _slot_main_preview_bytes(slot) -> bytes:
+        """Return only the main preview bitmap of a card slot.
+
+        ``preview_raw`` stores all per-colour preview bitmaps concatenated (main
+        preview first, then one block per additional colour).  The KB command
+        returns just the main preview; its length is kept in the slot header
+        bytes [24-25] (big-endian).
+        """
+        try:
+            data = bytes.fromhex(slot.preview_raw) if slot.preview_raw else b""
+        except ValueError:
+            return b""
+
+        raw_header = slot.header_raw or ""
+        if len(raw_header) >= 52:
+            try:
+                size = (int(raw_header[48:50], 16) << 8) | int(raw_header[50:52], 16)
+            except ValueError:
+                size = 0
+            if size > 0:
+                data = data[:size]
+        return data
+
     def _handle_read_card_preview(self) -> bytes:
         """Handle KB command: read preview image from a card memory slot.
 
@@ -1805,11 +1829,9 @@ class CommProtocol:
             self._state = self._STATE_IDLE
             return bytes([self.CTRL_NAK])
 
-        try:
-            preview_bytes = bytes.fromhex(slot.preview_raw) if slot.preview_raw else b""
-        except ValueError:
+        preview_bytes = self._slot_main_preview_bytes(slot)
+        if slot.preview_raw and not preview_bytes:
             logger.warning(f"Read Card Preview: invalid preview_raw hex in {stitch_type} slot {slot_id} - using empty")
-            preview_bytes = b""
 
         try:
             pattern_size = len(bytes.fromhex(slot.pattern_raw)) if slot.pattern_raw else 0

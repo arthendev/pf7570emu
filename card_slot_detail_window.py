@@ -16,7 +16,7 @@ from PyQt5.QtGui import QFont, QColor
 
 from machine_state import MemorySlot, EMBROIDERY_CANVAS_SMALL
 from pmemory_tab import PatternPreview
-from preview_render import CardPreviewImage, split_color_previews
+from preview_render import CardPreviewImage, split_preview_blocks
 
 
 class ClickableLabel(QLabel):
@@ -48,8 +48,8 @@ class CardSlotDetailWindow(QDialog):
         self._on_navigate = on_navigate
         self._machine_model = machine_model or ""
         self.card_no = card_no
-        # Card preview bitmaps: the main preview plus, for Embroidery, one
-        # per-colour preview per 288-byte colors_raw entry.
+        # Card preview bitmaps are all stored in preview_raw: the main preview
+        # followed by one block per additional thread colour (Embroidery only).
         self._card_previews = []
         self._card_preview_idx = 0
         # Do not display numeric slot IDs — title uses filename when available
@@ -126,8 +126,8 @@ class CardSlotDetailWindow(QDialog):
         self._card_preview_label.setAlignment(Qt.AlignCenter)
         bitmap_column.addWidget(self._card_preview_label)
 
-        # Switch between the main preview and the per-colour previews that
-        # Embroidery slots store in the thread-colour block.
+        # Switch between the main preview and the per-colour preview bitmaps
+        # that Embroidery slots store inside preview_raw.
         card_nav = QHBoxLayout()
         card_nav.setSpacing(4)
         self._card_prev_btn = QPushButton("◀")
@@ -153,7 +153,10 @@ class CardSlotDetailWindow(QDialog):
         preview_layout.addLayout(bitmap_column, 0)
 
         preview_group.setLayout(preview_layout)
-        layout.addWidget(preview_group)
+        # The preview area keeps its natural height; only the tab area below
+        # should grow when the window is resized.
+        preview_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        layout.addWidget(preview_group, 0)
 
         # Logical split checkbox
         split_row = QHBoxLayout()
@@ -198,7 +201,7 @@ class CardSlotDetailWindow(QDialog):
         raw_layout.addWidget(self._pattern_edit)
 
         # New field for memory card slots: preview_image (raw representation)
-        preview_image_label = QLabel("Preview image (raw)")
+        preview_image_label = QLabel("Preview images (raw, all colours)")
         preview_image_label.setFont(header_font)
         raw_layout.addWidget(preview_image_label)
 
@@ -207,17 +210,6 @@ class CardSlotDetailWindow(QDialog):
         self._preview_image_edit.setFont(QFont("Courier New", 9))
         self._preview_image_edit.setFixedHeight(80)
         raw_layout.addWidget(self._preview_image_edit)
-
-        # New field for memory card slots: thread colors (raw representation)
-        colors_label = QLabel("Thread colors (raw)")
-        colors_label.setFont(header_font)
-        raw_layout.addWidget(colors_label)
-
-        self._colors_edit = QTextEdit()
-        self._colors_edit.setReadOnly(True)
-        self._colors_edit.setFont(QFont("Courier New", 9))
-        self._colors_edit.setFixedHeight(80)
-        raw_layout.addWidget(self._colors_edit)
 
         raw_tab.setLayout(raw_layout)
         tabs.addTab(raw_tab, "Raw data")
@@ -302,7 +294,8 @@ class CardSlotDetailWindow(QDialog):
         stats_tab.setLayout(stats_layout)
         tabs.addTab(stats_tab, "Stats")
 
-        layout.addWidget(tabs)
+        tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(tabs, 1)
 
         # Buttons
         btn_layout = QHBoxLayout()
@@ -367,6 +360,14 @@ class CardSlotDetailWindow(QDialog):
         header_bytes = self._get_header_bytes()
         stats = self.slot.get_pattern_stats()
 
+        # Number of preview bitmaps stored in preview_raw: one per thread colour.
+        # The size of a single preview block is header bytes [24-25] (big-endian).
+        preview_size = 0
+        if len(header_bytes) > 25 and header_bytes[24] is not None and header_bytes[25] is not None:
+            preview_size = (header_bytes[24] << 8) | header_bytes[25]
+        preview_count = (len(self.slot.preview_raw) // (2 * preview_size)
+                         if preview_size else 1)
+
         if self.slot.pattern_type== "9mm":
             mapping = {
                 0: ("fix_0x00",         "Fixed byte?"),               # DONE
@@ -387,7 +388,7 @@ class CardSlotDetailWindow(QDialog):
                 22: ("y_min_symmetry",  "min(ys) with extra logic"),  # DONE
                 23: ("dx_abs_max",      "max(abs(dxs))"),             # DONE
                 24: ("size_preview",    "size(preview_image)"),       # DONE
-                26: ("n_colors",        "size(colors_raw)//288"),     # DONE
+                26: ("n_colors",        "size(preview_raw)//preview_size"),
                 27: ("size_pattern",    "size(pattern_raw)"),         # DONE
                 29: ("size_name",       "size(filename)"),            # DONE
             }
@@ -411,7 +412,7 @@ class CardSlotDetailWindow(QDialog):
                 22: ("fix_0x00",        "Fixed byte?"),               # DONE
                 23: ("dx_abs_max",      "max(abs(dxs))"),             # DONE
                 24: ("size_preview",    "size(preview_image)"),       # DONE
-                26: ("n_colors",        "size(colors_raw)//288"),     # DONE
+                26: ("n_colors",        "size(preview_raw)//preview_size"),
                 27: ("size_pattern",    "size(pattern_raw)"),         # DONE
                 29: ("size_name",       "size(filename)"),            # DONE
             }
@@ -433,8 +434,8 @@ class CardSlotDetailWindow(QDialog):
                 4: ("fix_0xC0",         "Fixed byte?"),               # DONE
                 5: ("fix_0x00",         "Fixed byte?"),               # DONE
                 6: ("type",             "Pattern type"),              # DONE
-                24: ("size_preview",    "size(preview_image)"),       # DONE
-                26: ("n_colors",        "size(colors_raw)//288"),     # DONE
+                24: ("size_preview",    "Fixed 288"),                 # DONE
+                26: ("n_colors",        "size(preview_raw)//preview_size"),
                 27: ("size_pattern",    "size(pattern_raw)"),         # DONE
                 29: ("size_name",       "size(filename)"),            # DONE
             }
@@ -552,11 +553,13 @@ class CardSlotDetailWindow(QDialog):
                 if stat_key == 'size_pattern':
                     stat_val_raw = len(self.slot.pattern_raw) // 2
                 elif stat_key == 'size_preview':
-                    stat_val_raw = len(self.slot.preview_raw) // 2
+                    # One preview block per colour; Embroidery blocks are fixed at 288 B.
+                    stat_val_raw = (288 if self.slot.pattern_type == "Embroidery"
+                                    else len(self.slot.preview_raw) // 2)
                 elif stat_key == 'size_name':
                     stat_val_raw = len(self.slot.filename) + 1
                 elif stat_key == 'n_colors':
-                    stat_val_raw = len(self.slot.colors_raw) // (2 * 288) - 1 if self.slot.colors_raw else 1
+                    stat_val_raw = preview_count
                 elif stat_key in card_expect: # Override with card-specific expectation if defined
                     stat_val_raw = card_expect[stat_key]
 
@@ -578,11 +581,13 @@ class CardSlotDetailWindow(QDialog):
                 if stat_key == 'size_pattern':
                     stat_val_raw = len(self.slot.pattern_raw) // 2
                 elif stat_key == 'size_preview':
-                    stat_val_raw = len(self.slot.preview_raw) // 2
+                    # One preview block per colour; Embroidery blocks are fixed at 288 B.
+                    stat_val_raw = (288 if self.slot.pattern_type == "Embroidery"
+                                    else len(self.slot.preview_raw) // 2)
                 elif stat_key == 'size_name':
                     stat_val_raw = len(self.slot.filename) + 1
                 elif stat_key == 'n_colors':
-                    stat_val_raw = len(self.slot.colors_raw) // (2 * 288) + 1 if self.slot.colors_raw else 1
+                    stat_val_raw = preview_count
                 elif stat_key in card_expect: # Override with card-specific expectation if defined
                     stat_val_raw = card_expect[stat_key]
 
@@ -881,20 +886,21 @@ class CardSlotDetailWindow(QDialog):
     def _collect_card_previews(self):
         """List the preview bitmaps stored in the slot.
 
-        The main preview comes from ``preview_raw``.  Embroidery slots may
-        additionally store one 288-byte preview per extra thread colour inside
-        ``colors_raw``; those are decoded exactly like the main preview.
+        ``preview_raw`` holds all preview bitmaps concatenated: the main preview
+        first, then one 288-byte block per additional thread colour (Embroidery
+        slots only).  Each block is decoded exactly like the main preview.
         """
-        previews = []
-        main = (getattr(self.slot, "preview_raw", "") or "").strip()
-        if main:
-            previews.append((main, "Main"))
+        raw = (getattr(self.slot, "preview_raw", "") or "").strip()
+        if not raw:
+            return []
 
         if self.slot.pattern_type == "Embroidery":
-            colors_raw = getattr(self.slot, "colors_raw", "") or ""
-            for i, chunk in enumerate(split_color_previews(colors_raw)):
-                previews.append((chunk, f"Colour {i + 2}"))
-        return previews
+            blocks = split_preview_blocks(raw)
+            return [(chunk, "Main" if i == 0 else f"Colour {i + 1}")
+                    for i, chunk in enumerate(blocks)]
+
+        # 9mm / MAXI slots carry a single preview bitmap.
+        return [(raw, "Main")]
 
     def _update_card_preview_nav(self):
         """Enable the switch buttons only when there is more than one image."""
@@ -1044,10 +1050,8 @@ class CardSlotDetailWindow(QDialog):
         self._header_edit_2.setPlainText(formatted_header)
         self._pattern_edit.setPlainText(
             self._format_pattern_raw(self.slot.pattern_raw, self.slot.pattern_type))
-        # preview_raw is the raw preview field for card slots
+        # preview_raw contains all preview bitmaps (main + per-colour blocks)
         self._preview_image_edit.setPlainText(self.slot.preview_raw)
-        # colors_raw is the raw thread-colors field for card slots
-        self._colors_edit.setPlainText(getattr(self.slot, "colors_raw", ""))
 
     def refresh(self):
         """Re-read from the slot and update all displayed fields."""

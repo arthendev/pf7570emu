@@ -528,8 +528,7 @@ class CardMemorySlot:
     """
     pattern_type: str = ""  # "9mm", "MAXI", "Embroidery"
     header_raw: str = ""
-    preview_raw: str = ""
-    colors_raw: str = ""    # thread-colour block (raw bytes as hex), between preview and pattern
+    preview_raw: str = ""    # all preview bitmaps concatenated (main + per-colour previews)
     pattern_raw: str = ""
     filename: str = ""
     pattern_bytes: List[int] = field(default_factory=list)
@@ -547,7 +546,6 @@ class CardMemorySlot:
         self.pattern_type = "Empty"
         self.header_raw = ""
         self.preview_raw = ""
-        self.colors_raw = ""
         self.pattern_raw = ""
         self.filename = ""
         self.pattern_bytes = []
@@ -565,12 +563,11 @@ class CardMemorySlot:
         """Get number of stitches in the pattern"""
         return len(self.pattern_xy) // 2
 
-    def set_slot_data(self, pattern_type: str, header_raw: str, preview_raw: str, pattern_raw: str, colors_raw: str = "") -> None:
+    def set_slot_data(self, pattern_type: str, header_raw: str, preview_raw: str, pattern_raw: str) -> None:
         """Set slot data and parse the pattern"""
         self.pattern_type = pattern_type
         self.header_raw = header_raw
         self.preview_raw = preview_raw
-        self.colors_raw = colors_raw
         self.pattern_raw = pattern_raw
         self.parse_pattern_data()
 
@@ -866,7 +863,6 @@ class CardMemorySlot:
             "pattern_type": self.pattern_type,
             "header_raw": self.header_raw,
             "preview_raw": self.preview_raw,
-            "colors_raw": self.colors_raw,
             "pattern_raw": self.pattern_raw,
             "filename": self.filename,
         }
@@ -882,7 +878,6 @@ class CardMemorySlot:
             pattern_type=data.get("pattern_type", ""),
             header_raw=data.get("header_raw", ""),
             preview_raw=data.get("preview_raw", ""),
-            colors_raw=data.get("colors_raw", ""),
             pattern_raw=data.get("pattern_raw", ""),
             filename=data.get("filename", ""),
         )

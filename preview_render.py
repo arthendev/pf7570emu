@@ -1,8 +1,12 @@
-"""Shared rendering of the 1bpp card preview bitmap.
+"""Shared rendering of the 1bpp card preview bitmaps.
 
-A card slot stores a small 1bpp bitmap next to the stitch data (``preview_raw``).
+A card slot stores its 1bpp preview bitmaps next to the stitch data
+(``preview_raw``).  The field holds the main preview followed by one block per
+additional thread colour (Embroidery only); ``decode_card_preview`` renders the
+first block, while ``split_preview_blocks`` exposes all of them.
+
 Both the Memory Card tab (48 px slot tiles) and the card slot detail window (a
-much larger preview) need to draw it, so the decoding and the scalable widget
+much larger preview) need to draw these, so the decoding and the scalable widget
 live here instead of being duplicated in each tab.
 """
 
@@ -15,22 +19,44 @@ from PyQt5.QtWidgets import QWidget
 COL_HEIGHT_9MM = 24
 COL_HEIGHT_DEFAULT = 48       # MAXI and Embroidery
 
-# Each additional thread colour of an Embroidery pattern ends with its own
-# 288-byte 1bpp preview (48 x 48 pixels), encoded like ``preview_raw``.
-COLOR_PREVIEW_BYTES = 288
+# Size of one preview bitmap per pattern type, in bytes.
+PREVIEW_SIZE_9MM = 159
+PREVIEW_SIZE_MAXI = 318
+PREVIEW_SIZE_EMBROIDERY = 288
+PREVIEW_SIZES = {
+    "9mm": PREVIEW_SIZE_9MM,
+    "MAXI": PREVIEW_SIZE_MAXI,
+    "Embroidery": PREVIEW_SIZE_EMBROIDERY,
+}
+
+# One preview-ish block per thread colour.  Kept as a named constant because the
+# per-colour blocks are what used to be stored in the separate colours field.
+COLOR_PREVIEW_BYTES = PREVIEW_SIZE_EMBROIDERY
 
 
-def split_color_previews(colors_raw: str):
-    """Split the thread-colour block into its 288-byte preview bitmaps.
+def main_preview_raw(preview_raw: str, pattern_type: str) -> str:
+    """Return only the first (main) preview block of ``preview_raw``.
 
-    The colours block is a sequence of fixed-size entries; the trailing
-    ``COLOR_PREVIEW_BYTES`` bytes of each entry hold a per-colour preview
-    image.  A trailing partial entry is ignored.
+    ``preview_raw`` holds all preview bitmaps concatenated: the main preview
+    followed by one block per additional thread colour.  Callers that only want
+    the main image (slot tiles, KB reads) use this helper.
     """
-    if not colors_raw:
+    block_bytes = PREVIEW_SIZES.get(pattern_type)
+    if not preview_raw or not block_bytes:
+        return preview_raw or ""
+    return preview_raw[:block_bytes * 2]
+
+
+def split_preview_blocks(preview_raw: str, block_bytes: int = COLOR_PREVIEW_BYTES):
+    """Split the preview field into its fixed-size per-colour blocks.
+
+    Each block is a 1bpp bitmap encoded exactly like the main preview.  A
+    trailing partial block is ignored.
+    """
+    if not preview_raw:
         return []
-    raw = colors_raw.strip()
-    chunk_chars = COLOR_PREVIEW_BYTES * 2
+    raw = preview_raw.strip()
+    chunk_chars = block_bytes * 2
     return [raw[i:i + chunk_chars]
             for i in range(0, len(raw) - chunk_chars + 1, chunk_chars)]
 
@@ -48,7 +74,7 @@ def decode_card_preview(preview_raw: str, pattern_type: str, is_embroidery: bool
     if not preview_raw:
         return None
     try:
-        data = bytes.fromhex(preview_raw.strip())
+        data = bytes.fromhex(main_preview_raw(preview_raw, pattern_type).strip())
     except (ValueError, AttributeError):
         return None
 
