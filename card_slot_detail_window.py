@@ -16,7 +16,7 @@ from PyQt5.QtGui import QFont, QColor
 
 from machine_state import MemorySlot, EMBROIDERY_CANVAS_SMALL
 from pmemory_tab import PatternPreview
-from preview_render import CardPreviewImage
+from preview_render import CardPreviewImage, split_color_previews
 
 
 class ClickableLabel(QLabel):
@@ -48,6 +48,10 @@ class CardSlotDetailWindow(QDialog):
         self._on_navigate = on_navigate
         self._machine_model = machine_model or ""
         self.card_no = card_no
+        # Card preview bitmaps: the main preview plus, for Embroidery, one
+        # per-colour preview per 288-byte colors_raw entry.
+        self._card_previews = []
+        self._card_preview_idx = 0
         # Do not display numeric slot IDs — title uses filename when available
         title = f"Card Slot - {self.slot.filename}" if self.slot.filename else "Card Slot - Details"
         self.setWindowTitle(title)
@@ -121,7 +125,31 @@ class CardSlotDetailWindow(QDialog):
         self._card_preview_label.setFont(tiny_font)
         self._card_preview_label.setAlignment(Qt.AlignCenter)
         bitmap_column.addWidget(self._card_preview_label)
+
+        # Switch between the main preview and the per-colour previews that
+        # Embroidery slots store in the thread-colour block.
+        card_nav = QHBoxLayout()
+        card_nav.setSpacing(4)
+        self._card_prev_btn = QPushButton("◀")
+        self._card_prev_btn.setFixedWidth(28)
+        self._card_prev_btn.setToolTip("Previous preview image")
+        self._card_prev_btn.clicked.connect(lambda: self._step_card_preview(-1))
+        self._card_counter_label = QLabel("0/0")
+        self._card_counter_label.setFont(tiny_font)
+        self._card_counter_label.setAlignment(Qt.AlignCenter)
+        self._card_next_btn = QPushButton("▶")
+        self._card_next_btn.setFixedWidth(28)
+        self._card_next_btn.setToolTip("Next preview image")
+        self._card_next_btn.clicked.connect(lambda: self._step_card_preview(+1))
+        card_nav.addStretch()
+        card_nav.addWidget(self._card_prev_btn)
+        card_nav.addWidget(self._card_counter_label)
+        card_nav.addWidget(self._card_next_btn)
+        card_nav.addStretch()
+        bitmap_column.addLayout(card_nav)
         bitmap_column.addStretch(1)
+
+        self._update_card_preview_nav()
         preview_layout.addLayout(bitmap_column, 0)
 
         preview_group.setLayout(preview_layout)
@@ -850,22 +878,71 @@ class CardSlotDetailWindow(QDialog):
         self._delete_btn.setEnabled(self.slot.pattern_type != "Empty")
         self._update_nav_buttons()
 
-    def _update_card_preview(self):
-        """Show the preview bitmap the card stores next to the stitch payload.
+    def _collect_card_previews(self):
+        """List the preview bitmaps stored in the slot.
 
-        The bitmap is independent of the stitch decoding, so it still gives a
-        usable preview when the payload itself cannot be parsed.
+        The main preview comes from ``preview_raw``.  Embroidery slots may
+        additionally store one 288-byte preview per extra thread colour inside
+        ``colors_raw``; those are decoded exactly like the main preview.
         """
-        raw = getattr(self.slot, "preview_raw", "") or ""
+        previews = []
+        main = (getattr(self.slot, "preview_raw", "") or "").strip()
+        if main:
+            previews.append((main, "Main"))
+
+        if self.slot.pattern_type == "Embroidery":
+            colors_raw = getattr(self.slot, "colors_raw", "") or ""
+            for i, chunk in enumerate(split_color_previews(colors_raw)):
+                previews.append((chunk, f"Colour {i + 2}"))
+        return previews
+
+    def _update_card_preview_nav(self):
+        """Enable the switch buttons only when there is more than one image."""
+        has_choice = len(self._card_previews) > 1
+        self._card_prev_btn.setEnabled(has_choice)
+        self._card_next_btn.setEnabled(has_choice)
+        if self._card_previews:
+            self._card_counter_label.setText(
+                f"{self._card_preview_idx + 1}/{len(self._card_previews)}")
+        else:
+            self._card_counter_label.setText("0/0")
+
+    def _step_card_preview(self, delta: int):
+        """Switch to the previous/next preview bitmap (wraps around)."""
+        if len(self._card_previews) <= 1:
+            return
+        self._card_preview_idx = (
+            self._card_preview_idx + delta) % len(self._card_previews)
+        self._show_card_preview()
+
+    def _update_card_preview(self):
+        """Show the preview bitmaps the card stores next to the stitch payload.
+
+        The bitmaps are independent of the stitch decoding, so they still give
+        a usable preview when the payload itself cannot be parsed.
+        """
+        self._card_previews = self._collect_card_previews()
+        self._card_preview_idx = 0
+        self._show_card_preview()
+
+    def _show_card_preview(self):
+        """Display the currently selected card preview bitmap."""
+        total = len(self._card_previews)
+        if not total:
+            self._card_preview.set_preview("", self.slot.pattern_type, False)
+            self._card_preview_label.setText("Card preview: none")
+            self._update_card_preview_nav()
+            return
+
+        raw, description = self._card_previews[self._card_preview_idx]
         is_embroidery = self.slot.pattern_type == "Embroidery"
         self._card_preview.set_preview(raw, self.slot.pattern_type, is_embroidery)
 
-        if not raw:
-            self._card_preview_label.setText("Card preview: none")
-        elif self._card_preview.has_preview():
-            self._card_preview_label.setText(f"Card preview ({len(raw) // 2} B)")
-        else:
-            self._card_preview_label.setText("Card preview: undecodable")
+        text = f"{description} ({len(raw) // 2} B)"
+        if not self._card_preview.has_preview():
+            text += " - undecodable"
+        self._card_preview_label.setText(text)
+        self._update_card_preview_nav()
 
     def _format_header_raw(self, raw: str) -> str:
         if not self._logical_split_cb.isChecked() or not raw:

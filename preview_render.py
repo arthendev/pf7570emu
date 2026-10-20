@@ -15,6 +15,25 @@ from PyQt5.QtWidgets import QWidget
 COL_HEIGHT_9MM = 24
 COL_HEIGHT_DEFAULT = 48       # MAXI and Embroidery
 
+# Each additional thread colour of an Embroidery pattern ends with its own
+# 288-byte 1bpp preview (48 x 48 pixels), encoded like ``preview_raw``.
+COLOR_PREVIEW_BYTES = 288
+
+
+def split_color_previews(colors_raw: str):
+    """Split the thread-colour block into its 288-byte preview bitmaps.
+
+    The colours block is a sequence of fixed-size entries; the trailing
+    ``COLOR_PREVIEW_BYTES`` bytes of each entry hold a per-colour preview
+    image.  A trailing partial entry is ignored.
+    """
+    if not colors_raw:
+        return []
+    raw = colors_raw.strip()
+    chunk_chars = COLOR_PREVIEW_BYTES * 2
+    return [raw[i:i + chunk_chars]
+            for i in range(0, len(raw) - chunk_chars + 1, chunk_chars)]
+
 
 def decode_card_preview(preview_raw: str, pattern_type: str, is_embroidery: bool = False):
     """Build a QImage from the raw preview bytes, or ``None`` when unavailable.
