@@ -3,7 +3,7 @@ Communication Interface emulator of Creative 7570, 7550, 1475 CD sewing machines
 
 <img width="500" height="500" alt="pf7570emu_500px" src="https://github.com/user-attachments/assets/876428c0-0595-4238-88d3-af83a926c435" />
 
-
+# Purpose
 I created this tool as a help in:
 - understanding the communication protocol
 - developing a custom stitch design & stitch transfer software
