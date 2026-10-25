@@ -1031,7 +1031,8 @@ class CommProtocol:
             response_slot = slot_id
         else:  # Embroidery
             space = self.machine_state.card_embroidery
-            slot_id = 0 # self._next_free_card_slot(space)
+            slot_id = self._next_free_card_slot(space)
+            # slot_id = 0 # DEBUG
             max_slot_id = self.CARD_MAX_SLOT_EMBROIDERY
             response_code = 0xC0
             response_slot = slot_id + 0xC8
@@ -1773,6 +1774,34 @@ class CommProtocol:
                 data = data[:size]
         return data
 
+    @staticmethod
+    def _card_preview_header_fields(slot) -> tuple:
+        """Return (colour_count, colour_mask, hoop_size) for the KB leading block.
+
+        All three values come from the slot's 30-byte KN header (``header_raw``,
+        stored as hex):
+          H[26]     colour count; above 2 the header stores it one too high, so
+                    the reported count is H[26] - 1
+          H[15-16]  16-bit mask over the 16-colour palette, big-endian; a set bit
+                    marks a palette colour the pattern uses
+          H[19]     hoop size: 1 = small hoop, 2 = big hoop
+        Bytes missing from a short header fall back to 0.
+        """
+        try:
+            header = bytes.fromhex(slot.header_raw or "")
+        except ValueError:
+            header = b""
+
+        def h(index: int) -> int:
+            return header[index] if index < len(header) else 0
+
+        colour_count = h(26)
+        if colour_count > 2:
+            colour_count -= 1
+        colour_mask = (h(15) << 8) | h(16)
+        hoop_size = h(19)
+        return colour_count, colour_mask, hoop_size
+
     def _handle_read_card_preview(self) -> bytes:
         """Handle KB command: read preview image from a card memory slot.
 
@@ -1785,9 +1814,16 @@ class CommProtocol:
           [7]    fixed: 00
 
         First response chunk:
-          CTRL_ACK | 00 00 00 00 | <pattern_size 2 bytes BE> | <fn_len_byte>
+          CTRL_ACK | <colour_count> | <colour_mask BE16> | <hoop_size>
+          | <pattern_size 2 bytes BE> | <fn_len_byte>
           | <filename+NUL> | <chunk_size> | <preview_bytes> | <chunk_size> | CTRL_ETB
           | <checksum>
+
+        The leading descriptor describes the pattern and comes from the slot
+        header (see _card_preview_header_fields):
+          colour_count  number of thread colours (header H[26], minus one above 2)
+          colour_mask   which of the 16 palette colours are used (header H[15-16])
+          hoop_size     1 = small hoop, 2 = big hoop (header H[19])
 
         Subsequent chunks (sent after each ACK while preview remains):
           CTRL_ENQ | <chunk_size> | <preview_bytes> | <chunk_size> | CTRL_ETB
@@ -1848,9 +1884,14 @@ class CommProtocol:
         chunk_data = bytes(self._read_card_preview_data[:chunk_size])
         self._read_card_preview_offset = chunk_size
 
+        colour_count, colour_mask, hoop_size = self._card_preview_header_fields(slot)
+
         response = bytearray()
         response.append(self.CTRL_ACK)
-        response.extend([0x00, 0x00, 0x00, 0x00])
+        response.append(colour_count & 0xFF)
+        response.append((colour_mask >> 8) & 0xFF)
+        response.append(colour_mask & 0xFF)
+        response.append(hoop_size & 0xFF)
         response.append((pattern_size >> 8) & 0xFF)
         response.append(pattern_size & 0xFF)
         response.append(fn_len_byte)
@@ -1865,7 +1906,8 @@ class CommProtocol:
         self._state = self._STATE_READ_KB_WAIT_ACK
         logger.info(
             f"Read Card Preview command received: card_no={card_no}, {stitch_type} slot {slot_id}, preview={len(self._read_card_preview_data)} B, "
-            f"pattern={pattern_size} B, filename={slot.filename!r} - sending first chunk"
+            f"pattern={pattern_size} B, filename={slot.filename!r}, colors={colour_count}, "
+            f"color_mask=0x{colour_mask:04X}, hoop={hoop_size} - sending first chunk"
         )
         logger.info(
             f"Read Card Preview: chunk {chunk_size} B, offset {0}/{len(self._read_card_preview_data)}, checksum 0x{checksum:02X}"
