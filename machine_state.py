@@ -480,19 +480,61 @@ def _parse_command_group(data: bytes, index: int):
     return None                     # the group never closed
 
 
+def split_embroidery_payload(data: bytes) -> List[tuple]:
+    """Split an Embroidery payload into the logical blocks the decoder walks.
+
+    Returns ``(kind, start, end)`` byte ranges where *kind* is
+
+    ``"group"``  a ``0x80 ... 0x80`` command group
+    ``"steps"``  a run of plain relative steps (two signed bytes each)
+    ``"rest"``   payload the decoder does not understand (walk stops there)
+
+    The walk mirrors decode_embroidery_payload(), so the blocks line up exactly
+    with what gets decoded.
+    """
+    blocks: List[tuple] = []
+    index = 0
+    while index < len(data):
+        if data[index] != EMBROIDERY_GROUP_MARK:
+            # Plain relative steps, checked only at step boundaries so that an
+            # 0x80 inside a delta byte does not look like a group.
+            start = index
+            while index < len(data):
+                if data[index] == EMBROIDERY_GROUP_MARK:
+                    break
+                if index + 2 > len(data):
+                    index = len(data)
+                    break
+                index += 2
+            blocks.append(("steps", start, index))
+            continue
+
+        parsed = _parse_command_group(data, index)
+        if parsed is None:
+            blocks.append(("rest", index, len(data)))
+            break
+        _commands, next_index = parsed
+        blocks.append(("group", index, next_index))
+        index = next_index
+    return blocks
+
+
 def decode_embroidery_payload(raw_hex: str,
                               colour_points: Optional[List[int]] = None,
                               filename_out: Optional[List[str]] = None,
                               sections_out: Optional[List[tuple]] = None,
                               colour_table_out: Optional[List[tuple]] = None,
-                              values_out: Optional[List[tuple]] = None):
+                              values_out: Optional[List[tuple]] = None,
+                              origin_out: Optional[List[tuple]] = None):
     """Decode an Embroidery card payload into protocol-unit points.
 
     Returns ``(pattern_xy, data, consumed)`` — an interleaved x/y list in
     protocol units (1/10 mm), the payload bytes and how many of them the walk
-    understood.  ``pattern_xy`` is empty when nothing could be decoded;
-    ``consumed < len(data)`` means an unknown command stopped the walk, so the
-    returned geometry is only the leading part of the design.
+    understood.  The points are the values the payload carries: distances from
+    the design origin, which is reported separately through ``origin_out``.
+    ``pattern_xy`` is empty when nothing could be decoded; ``consumed <
+    len(data)`` means an unknown command stopped the walk, so the returned
+    geometry is only the leading part of the design.
 
     Optional out-parameters (appended to, so they stay untouched when the payload
     carries nothing of that kind):
@@ -502,8 +544,12 @@ def decode_embroidery_payload(raw_hex: str,
     ``sections_out``      ``(first point index, colour number)`` per colour
                           section, starting with the initial colour
     ``colour_table_out``  the software's colour table, 16 x ``(r, g, b)``
-    ``values_out``        the raw ``(axis0, axis1)`` payload values per stitch,
-                          i.e. the design positions in protocol units
+    ``origin_out``        ``(axis A, axis B)`` from the ``28 05 00`` command, i.e.
+                          the design's top-right corner in protocol units; the
+                          position values are distances from it towards the
+                          bottom-left
+    ``values_out``        the same ``(axis0, axis1)`` payload values per stitch
+                          as ``pattern_xy``, itemised per point
     """
     try:
         data = bytes.fromhex((raw_hex or "").strip())
@@ -521,6 +567,7 @@ def decode_embroidery_payload(raw_hex: str,
     sections: List[tuple] = []
     title = ""
     colour_table: List[tuple] = []
+    origin: Optional[tuple] = None
 
     def add_point(value_a: int, value_b: int, point_colour: int) -> None:
         """Record one stitch and open a new colour section when it changes."""
@@ -563,9 +610,12 @@ def decode_embroidery_payload(raw_hex: str,
             elif marker == EMBROIDERY_CMD_TITLE:
                 title = payload.split(b"\x00", 1)[0].decode("latin-1", errors="replace")
             elif marker == EMBROIDERY_CMD_EXTRA:
-                # 28 05 00 x y is the design origin, which the positions below
-                # already carry, so only the colour table is of interest here.
-                if len(payload) >= 65 and payload[0] == EMBROIDERY_EXTRA_COLOUR_TABLE:
+                # 28 05 00 A B is the design origin (little-endian), the corner
+                # every position is measured from; 28 41 01 is the colour table.
+                if len(payload) >= 5 and payload[0] == EMBROIDERY_EXTRA_ORIGIN:
+                    origin = (int.from_bytes(payload[1:3], "little"),
+                              int.from_bytes(payload[3:5], "little"))
+                elif len(payload) >= 65 and payload[0] == EMBROIDERY_EXTRA_COLOUR_TABLE:
                     table = payload[1:65]
                     colour_table = [tuple(table[i * 4:i * 4 + 3]) for i in range(16)]
             elif marker == EMBROIDERY_CMD_END:
@@ -583,9 +633,9 @@ def decode_embroidery_payload(raw_hex: str,
         if end_of_design:
             break
 
-    # Positions stay in protocol units (1/10 mm) — no conversion to canvas units
-    # (1/6 mm) happens here, so every statistic derived from them matches the
-    # pattern header directly.
+    # Positions stay exactly as the payload carries them: protocol units (1/10 mm)
+    # measured from the design origin.  No canvas-unit conversion and no origin
+    # applied — the origin is stored separately and available to the caller.
     xs = [value_b for _value_a, value_b in values]
     ys = [value_a for value_a, _value_b in values]
 
@@ -612,6 +662,8 @@ def decode_embroidery_payload(raw_hex: str,
         colour_table_out.extend(colour_table)
     if values_out is not None:
         values_out.extend(values)
+    if origin_out is not None and origin is not None:
+        origin_out.append(origin)
     return pattern_xy, data, index
 
 
@@ -645,6 +697,11 @@ class CardMemorySlot:
     # The software's colour table from the 0x28 41 01 command: 16 x (r, g, b),
     # or empty when the design carries no thread colours.
     payload_colour_table: List[tuple] = field(default_factory=list)
+    # Design origin from the 0x28 05 00 command: (axis A, axis B) in protocol
+    # units, i.e. the top-right corner the position values are measured from.
+    # Empty when the payload carries no origin.  Derived from pattern_raw by
+    # parse_pattern_data(), so not persisted.
+    payload_origin: tuple = ()
 
     def clear(self) -> None:
         """Remove this slot from its parent CardMemorySpace (if set) and clear data.
@@ -666,6 +723,7 @@ class CardMemorySlot:
         self.payload_filename = ""
         self.payload_section_colours = []
         self.payload_colour_table = []
+        self.payload_origin = ()
         parent = self._parent
         parent.slots.remove(self)
 
@@ -702,6 +760,7 @@ class CardMemorySlot:
         payload_filename = ""
         section_colours: List[int] = []
         colour_table: List[tuple] = []
+        origin: List[tuple] = []
 
         if self.pattern_type == "9mm":
             # Card 9mm encoding: raw is hex bytes. First/last byte may be 0x80/0x8A markers.
@@ -830,7 +889,7 @@ class CardMemorySlot:
             sections: List[tuple] = []
             pattern_xy, body, consumed = decode_embroidery_payload(
                 self.pattern_raw, color_change_points, names, sections,
-                colour_table)
+                colour_table, origin_out=origin)
             payload_filename = names[0] if names else ""
             section_colours = [number for _start, number in sections]
             pattern_bytes = list(body[:consumed]) if consumed else list(body)
@@ -848,6 +907,33 @@ class CardMemorySlot:
         self.payload_filename = payload_filename
         self.payload_section_colours = section_colours
         self.payload_colour_table = colour_table
+        self.payload_origin = origin[0] if origin else ()
+
+    def get_display_xy(self) -> List[int]:
+        """Points oriented the way the design is drawn in the hoop.
+
+        Embroidery positions are stored as distances from the design origin
+        towards the bottom-left, so drawing them directly mirrors the design into
+        the opposite corner.  The display mirror is
+
+            display_x = origin_x - x,   display_y = origin_y - y
+
+        which flips both axes and places the origin at the pattern's top-right
+        corner, exactly where the machine measures from.  Every other pattern
+        type is already canvas-oriented and is returned unchanged.
+        """
+        points = list(self.pattern_xy)
+        if self.pattern_type != "Embroidery" or not self.payload_origin:
+            return points
+        # payload_origin is (axis A, axis B) = (y, x) in protocol units.
+        origin_a, origin_b = self.payload_origin
+        origin_x, origin_y = origin_b, origin_a
+        xs = points[0::2]
+        ys = points[1::2]
+        display: List[int] = []
+        for x, y in zip(xs, ys):
+            display.extend([int(origin_x - x), int(origin_y - y)])
+        return display
 
     def _hoop_units(self) -> Optional[tuple]:
         """Hoop size (width, height) in protocol units from header byte [19].
@@ -885,7 +971,8 @@ class CardMemorySlot:
             "y_min_to_bound": None,  # 0x36 - y_min
             "y_min_symmetry": None,  # this one is tricky; used for memory card upload
             "span_x": None, "span_y": None,
-            "hoop_x": None, "hoop_y": None, # Embroidery only
+            "origin_x": None, "origin_y": None, # Embroidery only
+            "hoop_width": None, "hoop_height": None, # Embroidery only
             "x_min_centered": None, "y_min_centered": None, # Embroidery only
             "dx_max": None, "dx_min": None,
             "dx_min_abs": None, "dx_abs_max": None,
@@ -954,14 +1041,23 @@ class CardMemorySlot:
         stats["span_x"] = stats["x_max"] - stats["x_min"]
         stats["span_y"] = stats["y_max"] - stats["y_min"]
 
-        # Embroidery: header byte [19] names the hoop, so the frame the design
-        # sits in and where its lower edge would be when centred follow in the
-        # same unit.
-        hoop = self._hoop_units() if self.pattern_type == "Embroidery" else None
-        if hoop is not None:
-            stats["hoop_x"], stats["hoop_y"] = hoop
-            stats["x_min_centered"] = (hoop[0] - stats["span_x"]) // 2
-            stats["y_min_centered"] = (hoop[1] - stats["span_y"]) // 2
+        # Embroidery: header byte [19] names the hoop the design sits in, and the
+        # payload's origin is its top-right corner, so the design's lower edges
+        # ("min x/y in hoop" in the header) are the origin minus the spans.  Only
+        # statistics use the origin; the points themselves stay as encoded.
+        if self.pattern_type == "Embroidery":
+            hoop_size = self._hoop_units()
+            if hoop_size is not None:
+                stats["hoop_width"], stats["hoop_height"] = hoop_size
+                # This calculation results in +/-1 difference from the original header sent by PCD
+                # ToDo: find out why the original header has a difference of 1 in some cases
+                stats["x_min_centered"] = (hoop_size[0] - stats["span_x"]) // 2
+                stats["y_min_centered"] = (hoop_size[1] - stats["span_y"]) // 2
+            if self.payload_origin:
+                stats["origin_y"], stats["origin_x"] = self.payload_origin
+            else:
+                stats["origin_x"] = None
+                stats["origin_y"] = None
 
         if len(xs) > 1:
             dxs = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
@@ -977,7 +1073,7 @@ class CardMemorySlot:
         stats["dy_min"] = min(dys)
         stats["dy_min_abs"] = abs(stats["dy_min"])
         stats["dy_abs_max"] = max(abs(d) for d in dys)
-        stats["is_reversed"] = xs[-1] < xs[0]
+        stats["is_reversed"] = xs[-1] < xs[0] if self.pattern_type != "Embroidery" else None
         stats["dx_0n"] = xs[-1] - xs[0]
         stats["dx_0n_abs"] = abs(stats["dx_0n"])
         stats["dy_0n"] = ys[-1] - ys[0]

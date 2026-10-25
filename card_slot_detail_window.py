@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import QShortcut
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtGui import QFont, QColor, QPainter, QPen, QBrush
 
-from machine_state import MemorySlot
+from machine_state import MemorySlot, split_embroidery_payload
 from pmemory_tab import PatternPreview
 from preview_render import CardPreviewImage, split_preview_blocks
 
@@ -46,7 +46,7 @@ CARD_COLOR_PALETTE = [
 # Header two-byte groupings: high byte -> low byte, shared by the Header tab and
 # the "Logical split" display of the raw header.  9mm and MAXI carry two
 # unrelated single-byte values in bytes 22 and 23, so those stay apart;
-# Embroidery has one 16-bit value there (x_min_centered).
+# Embroidery has one 16-bit value there.
 HEADER_TWO_BYTE_PAIRS = {7: 8, 9: 10, 11: 12, 13: 14,
                          15: 16, 17: 18, 20: 21, 24: 25, 27: 28}
 HEADER_TWO_BYTE_PAIRS_EMBROIDERY = {**HEADER_TWO_BYTE_PAIRS, 22: 23}
@@ -233,6 +233,9 @@ class ClickableLabel(QLabel):
 
 class CardSlotDetailWindow(QDialog):
     """Non-modal window showing detailed information about a memory card slot."""
+
+    # Number of plain relative steps per row in the Embroidery raw view.
+    STEPS_PER_ROW = 16
 
     def __init__(self, slots: list, slot_id: int, on_clear=None, on_navigate=None,
                  machine_model: str = None, card_no=None, parent=None):
@@ -646,8 +649,8 @@ class CardSlotDetailWindow(QDialog):
                 15: ("span_x",          "max(xs) - min(xs)"),         # DONE
                 17: ("colour_mask",     "colour mask, bit n = colour n+1"),  # DONE
                 19: ("hoop_type",       "1 = small hoop, 2 = large hoop"),   # DONE
-                20: ("y_min_centered", "(hoop_y - span_y)/2"),
-                22: ("x_min_centered", "(hoop_x - span_x)/2"),
+                20: ("y_min_centered",  "(hoop_height - span_y) / 2"),      # DONE
+                22: ("x_min_centered",  "(hoop_width - span_x) / 2"),       # DONE
                 24: ("size_preview",    "Fixed 288"),                 # DONE
                 26: ("n_colors",        "size(preview_raw)//preview_size"),  # DONE
                 27: ("size_pattern",    "size(pattern_raw)"),         # DONE
@@ -853,6 +856,10 @@ class CardSlotDetailWindow(QDialog):
             ("y_min_symmetry",      s["y_min_symmetry"], None),
             ("span_x",              s["span_x"],        None),
             ("span_y",              s["span_y"],        None),
+            ("origin_x",            s["origin_x"],      None),
+            ("origin_y",            s["origin_y"],      None),
+            ("hoop_width",          s["hoop_width"],    None),
+            ("hoop_height",         s["hoop_height"],   None),
             ("dx_max",              s["dx_max"],        None),
             ("dx_min",              s["dx_min"],        None),
             ("dx_min_abs",          s["dx_min_abs"],    None),
@@ -1091,7 +1098,10 @@ class CardSlotDetailWindow(QDialog):
         ptype = self.slot.pattern_type
         if ptype in ("9mm", "MAXI", "Embroidery"):
             self.slot.parse_pattern_data()
-        self._preview.pattern_xy = self._display_xy()
+        # Embroidery positions are distances from the design origin, so the
+        # preview needs the mirrored, origin-based orientation (see
+        # CardMemorySlot.get_display_xy); other types plot as decoded.
+        self._preview.pattern_xy = self.slot.get_display_xy()
         self._preview.pattern_type = self.slot.pattern_type
         # Thread-colour sections come from the decoded payload (Embroidery only);
         # other pattern types stay single-colour and keep the default preview pen.
@@ -1110,36 +1120,14 @@ class CardSlotDetailWindow(QDialog):
         self._delete_btn.setEnabled(self.slot.pattern_type != "Empty")
         self._update_nav_buttons()
 
-    def _display_xy(self):
-        """Pattern coordinates in the hoop frame, for the preview.
-
-        Embroidery patterns are stored in protocol units measured from the far
-        edge of the design, so they are mirrored into the hoop and shifted by the
-        centring margin.  Every other pattern type is drawn as stored.
-        """
-        coordinates = list(self.slot.pattern_xy)
-        if self.slot.pattern_type != "Embroidery":
-            return coordinates
-
-        stats = self.slot.get_pattern_stats()
-        if stats.get("span_x") is None or stats.get("x_min_centered") is None:
-            return coordinates
-
-        x_offset = stats["x_min_centered"] + stats["span_x"]
-        y_offset = stats["y_min_centered"] + stats["span_y"]
-        display = []
-        for i in range(0, len(coordinates) - 1, 2):
-            display.extend([x_offset - coordinates[i], y_offset - coordinates[i + 1]])
-        return display
-
     def _display_canvas(self):
-        """Canvas extent (width, height) matching _display_xy(), or None."""
+        """Canvas extent (width, height) matching the stored points, or None."""
         if self.slot.pattern_type != "Embroidery":
             return None
         stats = self.slot.get_pattern_stats()
-        if stats.get("hoop_x") is None:
+        if stats.get("hoop_width") is None:
             return None
-        return (stats["hoop_x"], stats["hoop_y"])
+        return (stats["hoop_width"], stats["hoop_height"])
 
     def _colour_palette(self):
         """Return one QColor per thread-colour section, in section order.
@@ -1270,6 +1258,10 @@ class CardSlotDetailWindow(QDialog):
         if not self._logical_split_cb.isChecked() or not raw:
             return raw
 
+        # Embroidery is not a record stream: show the command blocks instead.
+        if pattern_type == "Embroidery":
+            return self._format_embroidery_raw(raw)
+
         # Split raw hex string into byte strings (2 chars each). Keep original casing.
         raw = raw.strip()
         bytes_list = [raw[i:i+2] for i in range(0, len(raw), 2) if raw[i:i+2]]
@@ -1311,6 +1303,37 @@ class CardSlotDetailWindow(QDialog):
             rows.append(' '.join(rem))
 
         return '\n'.join(rows)
+
+    def _format_embroidery_raw(self, raw: str) -> str:
+        """Show the Embroidery payload as the blocks the decoder walks.
+
+        Every ``0x80 ... 0x80`` command group gets its own line.  The relative
+        steps between the groups belong together, so they are wrapped into rows
+        of ``STEPS_PER_ROW`` bytes rather than turned into one endless line.
+        Bytes the decoder cannot parse stay as a trailing line instead of being
+        dropped.
+        """
+        hex_text = ''.join(raw.split())
+        try:
+            data = bytes.fromhex(hex_text)
+        except ValueError:
+            return raw
+        if not data:
+            return raw
+
+        def to_row(chunk: str) -> str:
+            return ' '.join(chunk[i:i + 2] for i in range(0, len(chunk), 2))
+
+        steps_width = self.STEPS_PER_ROW * 2
+        lines = []
+        for kind, start, end in split_embroidery_payload(data):
+            chunk = hex_text[start * 2:end * 2]
+            if kind == "steps":
+                for i in range(0, len(chunk), steps_width):
+                    lines.append(to_row(chunk[i:i + steps_width]))
+            else:
+                lines.append(to_row(chunk))
+        return '\n'.join(lines)
 
     def _format_preview_raw(self, raw: str) -> str:
         """Split the stored preview bitmaps into one block per thread colour.
