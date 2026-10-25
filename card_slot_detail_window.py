@@ -628,8 +628,8 @@ class CardSlotDetailWindow(QDialog):
                 15: ("span_x",          "max(xs) - min(xs)"),         # DONE
                 17: ("colour_mask",     "colour mask, bit n = colour n+1"),  # DONE
                 19: ("hoop_type",       "1 = small hoop, 2 = large hoop"),   # DONE
-                20: ("min_y",           "min(ys)"),
-                22: ("min_x",           "min(xs)"),
+                20: ("y_min_centered", "(hoop_y - span_y)/2"),
+                22: ("x_min_centered", "(hoop_x - span_x)/2"),
                 24: ("size_preview",    "Fixed 288"),                 # DONE
                 26: ("n_colors",        "size(preview_raw)//preview_size"),  # DONE
                 27: ("size_pattern",    "size(pattern_raw)"),         # DONE
@@ -1104,11 +1104,11 @@ class CardSlotDetailWindow(QDialog):
             return coordinates
 
         stats = self.slot.get_pattern_stats()
-        if stats.get("span_x") is None or stats.get("min_x") is None:
+        if stats.get("span_x") is None or stats.get("x_min_centered") is None:
             return coordinates
 
-        x_offset = stats["min_x"] + stats["span_x"]
-        y_offset = stats["min_y"] + stats["span_y"]
+        x_offset = stats["x_min_centered"] + stats["span_x"]
+        y_offset = stats["y_min_centered"] + stats["span_y"]
         display = []
         for i in range(0, len(coordinates) - 1, 2):
             display.extend([x_offset - coordinates[i], y_offset - coordinates[i + 1]])

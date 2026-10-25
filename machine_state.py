@@ -408,12 +408,13 @@ EMBROIDERY_IGNORED_COMMANDS = frozenset(
 # Embroidery resolution (approx. 1/10 mm) vs. canvas (9mm/MAXI) units (1/6 mm)
 EMBROIDERY_SCALE = 256/153
 
-# Hoop dimensions in canvas units (1/6 mm); the header only has a code for
-# them, so the slot converts them to protocol units for the preview frame.
-# Small and large hoop designs share the payload format, so a large-hoop slot
-# cannot be recognised from the payload alone.
-EMBROIDERY_CANVAS_SMALL = (480, 480)
-EMBROIDERY_CANVAS_LARGE = (720, 690)
+# Hoop sizes in protocol units (approx. 1/10 mm)
+EMBROIDERY_HOOP_SMALL = (803, 803) # width, height in protocol units (1/10 mm)
+EMBROIDERY_HOOP_LARGE = (1204, 1154) # width, height in protocol units (1/10 mm)
+
+# The same hoops in canvas units (1/6 mm)
+EMBROIDERY_CANVAS_SMALL = (480, 480) # width, height in canvas units (1/6 mm)
+EMBROIDERY_CANVAS_LARGE = (720, 690) # width, height in canvas units (1/6 mm)
 
 
 def _signed_byte(value: int) -> int:
@@ -862,12 +863,10 @@ class CardMemorySlot:
         except ValueError:
             return None
         if hoop == 1:
-            width, height = EMBROIDERY_CANVAS_SMALL
-        elif hoop == 2:
-            width, height = EMBROIDERY_CANVAS_LARGE
-        else:
-            return None
-        return int(width * EMBROIDERY_SCALE), int(height * EMBROIDERY_SCALE)
+            return EMBROIDERY_HOOP_SMALL
+        if hoop == 2:
+            return EMBROIDERY_HOOP_LARGE
+        return None
 
     def get_pattern_stats(self) -> dict:
         """Compute statistics from the pattern data (x,y interleaved).
@@ -886,10 +885,8 @@ class CardMemorySlot:
             "y_min_to_bound": None,  # 0x36 - y_min
             "y_min_symmetry": None,  # this one is tricky; used for memory card upload
             "span_x": None, "span_y": None,
-            # Embroidery only: the hoop from header byte [19] and the centring
-            # margins PCD derives from it, all in protocol units.
-            "hoop_x": None, "hoop_y": None,
-            "min_x": None, "min_y": None,
+            "hoop_x": None, "hoop_y": None, # Embroidery only
+            "x_min_centered": None, "y_min_centered": None, # Embroidery only
             "dx_max": None, "dx_min": None,
             "dx_min_abs": None, "dx_abs_max": None,
             "dy_max": None, "dy_min": None,
@@ -958,12 +955,13 @@ class CardMemorySlot:
         stats["span_y"] = stats["y_max"] - stats["y_min"]
 
         # Embroidery: header byte [19] names the hoop, so the frame the design
-        # sits in and the centring margins PCD writes follow in the same unit.
+        # sits in and where its lower edge would be when centred follow in the
+        # same unit.
         hoop = self._hoop_units() if self.pattern_type == "Embroidery" else None
         if hoop is not None:
             stats["hoop_x"], stats["hoop_y"] = hoop
-            stats["min_y"] = (hoop[1] - stats["span_y"]) // 2
-            stats["min_x"] = (hoop[0] - stats["span_x"]) // 2
+            stats["x_min_centered"] = (hoop[0] - stats["span_x"]) // 2
+            stats["y_min_centered"] = (hoop[1] - stats["span_y"]) // 2
 
         if len(xs) > 1:
             dxs = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
