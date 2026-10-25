@@ -1032,7 +1032,6 @@ class CommProtocol:
         else:  # Embroidery
             space = self.machine_state.card_embroidery
             slot_id = self._next_free_card_slot(space)
-            # slot_id = 0 # DEBUG
             max_slot_id = self.CARD_MAX_SLOT_EMBROIDERY
             response_code = 0xC0
             response_slot = slot_id + 0xC8
@@ -1258,20 +1257,6 @@ class CommProtocol:
             filename = filename_bytes.rstrip(b'\x00').decode('latin-1', errors='replace')
         except Exception:
             filename = ""
-
-        # Experimental: dump the raw stitch-pattern bytes to disk for offline analysis.
-        # The file is named after the payload's filename field (null-terminated) + .bin.
-        try:
-            dump_dir = r"c:\temp\emb_re\out"
-            os.makedirs(dump_dir, exist_ok=True)
-            dump_name = filename_bytes.rstrip(b'\x00').decode('latin-1', errors='replace')
-            dump_name = os.path.basename(dump_name) or "unnamed"
-            dump_path = os.path.join(dump_dir, dump_name + ".bin")
-            with open(dump_path, "wb") as f:
-                f.write(pattern_bytes)
-            logger.info(f"Write Card: dumped {len(pattern_bytes)} pattern bytes to {dump_path}")
-        except OSError as e:
-            logger.warning(f"Write Card: could not dump pattern bytes to {dump_dir!r}: {e}")
 
         slot = CardMemorySlot(
             pattern_type = self._write_card_stitch_type,
