@@ -544,6 +544,18 @@ class CardSlotDetailWindow(QDialog):
                 bytes_list.append(None)
         return bytes_list
 
+    @staticmethod
+    def _preview_block_size(header_bytes) -> int:
+        """Size in bytes of one preview bitmap block (header bytes [24-25]).
+
+        Returns 0 when the header does not carry a usable size.
+        """
+        if (len(header_bytes) > 25
+                and header_bytes[24] is not None
+                and header_bytes[25] is not None):
+            return (header_bytes[24] << 8) | header_bytes[25]
+        return 0
+
     def _populate_header_grid(self):
         while self._header_grid.count():
             item = self._header_grid.takeAt(0)
@@ -555,9 +567,7 @@ class CardSlotDetailWindow(QDialog):
 
         # Number of preview bitmaps stored in preview_raw: one per thread colour.
         # The size of a single preview block is header bytes [24-25] (big-endian).
-        preview_size = 0
-        if len(header_bytes) > 25 and header_bytes[24] is not None and header_bytes[25] is not None:
-            preview_size = (header_bytes[24] << 8) | header_bytes[25]
+        preview_size = self._preview_block_size(header_bytes)
         preview_count = (len(self.slot.preview_raw) // (2 * preview_size)
                          if preview_size else 1)
 
@@ -1302,6 +1312,27 @@ class CardSlotDetailWindow(QDialog):
 
         return '\n'.join(rows)
 
+    def _format_preview_raw(self, raw: str) -> str:
+        """Split the stored preview bitmaps into one block per thread colour.
+
+        ``preview_raw`` concatenates the bitmaps without any separator.  One
+        block is ``size_preview`` bytes (header bytes [24-25]), so inserting an
+        empty line between the blocks shows where one colour's preview ends and
+        the next one starts.  Other pattern types carry a single bitmap.
+        """
+        if not self._logical_split_cb.isChecked() or not raw:
+            return raw
+        if self.slot.pattern_type != "Embroidery":
+            return raw
+
+        raw = raw.strip()
+        block_chars = self._preview_block_size(self._get_header_bytes()) * 2
+        if not raw or block_chars <= 0:
+            return raw
+
+        blocks = [raw[i:i + block_chars] for i in range(0, len(raw), block_chars)]
+        return '\n\n'.join(blocks)
+
     def _on_show_canvas_changed(self):
         self._preview.show_canvas = self._show_canvas_cb.isChecked()
         self._preview.update()
@@ -1317,7 +1348,8 @@ class CardSlotDetailWindow(QDialog):
         self._pattern_edit.setPlainText(
             self._format_pattern_raw(self.slot.pattern_raw, self.slot.pattern_type))
         # preview_raw contains all preview bitmaps (main + per-colour blocks)
-        self._preview_image_edit.setPlainText(self.slot.preview_raw)
+        self._preview_image_edit.setPlainText(
+            self._format_preview_raw(self.slot.preview_raw))
 
     def refresh(self):
         """Re-read from the slot and update all displayed fields."""
