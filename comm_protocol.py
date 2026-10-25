@@ -52,6 +52,15 @@ class CommProtocol:
     CMD_DELETE_CARD = "KL"
     CMD_READ_CARD_SLOT = "KS"
 
+    # Raw (binary-payload) commands that normally arrive as CTRL_ETX + mnemonic.
+    # None of the text commands above share these mnemonics.
+    RAW_CARD_COMMANDS = (
+        CMD_WRITE_CARD,
+        CMD_READ_CARD_PREVIEW,
+        CMD_READ_CARD_SLOT,
+        CMD_DELETE_CARD,
+    )
+
     # Internal state machine states
     _STATE_IDLE = 0
     _STATE_WRITE_DATA = 1         # collecting chunk data bytes
@@ -210,28 +219,7 @@ class CommProtocol:
         for byte in data:
 
             if self._state == self._STATE_IDLE:
-                if byte == self.CTRL_EOT:
-                    if self.cmd_buffer:
-                        logger.warning(f"Discarding partial buffer on CTRL_EOT: {bytes(self.cmd_buffer)!r}")
-                        self.cmd_buffer.clear()
-                    self._state = self._STATE_IDLE
-                    logger.info("End of transmission")
-                elif byte == self.CTRL_BEL:
-                    if self.cmd_buffer:
-                        logger.warning(f"Discarding partial buffer on CTRL_BEL: {bytes(self.cmd_buffer)!r}")
-                        self.cmd_buffer.clear()
-                    response.extend(self.handle_bell_command())
-                elif byte == self.CTRL_ETX:
-                    if self.cmd_buffer:
-                        cmd_str = self.cmd_buffer.decode('ascii', errors='replace')
-                        self.cmd_buffer.clear()
-                        response.extend(self._dispatch_text_command(cmd_str))
-                    else:
-                        # CTRL_ETX with empty buffer is the prefix for a raw command (KN, KB, KL)
-                        self._raw_cmd_mnemonic_buffer = bytearray()
-                        self._state = self._STATE_RAW_CMD_MNEMONIC
-                else:
-                    self.cmd_buffer.append(byte)
+                response.extend(self._handle_idle_byte(byte))
 
             elif self._state == self._STATE_WAIT_ACK:
                 if byte == self.CTRL_EOT:
@@ -417,8 +405,17 @@ class CommProtocol:
                     logger.info("Write Card: EOT received waiting for final CTRL_ETX - aborting")
                     self._abort_write_card()
                 else:
-                    logger.warning(f"Write Card: unexpected byte 0x{byte:02X} waiting for final CTRL_ETX - aborting")
-                    self._abort_write_card()
+                    # The transfer is already complete (all expected bytes were received),
+                    # but the host moved straight on to the next command without sending
+                    # the terminating CTRL_ETX. Commit the accumulated data and treat this
+                    # byte as the first byte of that new command.
+                    logger.info(
+                        f"Write Card: byte 0x{byte:02X} received instead of the final CTRL_ETX - "
+                        f"committing card write and continuing with the next command"
+                    )
+                    self._commit_write_card()
+                    self._state = self._STATE_IDLE
+                    response.extend(self._handle_idle_byte(byte))
 
             elif self._state == self._STATE_RAW_CMD_MNEMONIC:
                 if byte == self.CTRL_EOT:
@@ -439,40 +436,7 @@ class CommProtocol:
                     if len(self._raw_cmd_mnemonic_buffer) == 2:
                         mnemonic = bytes(self._raw_cmd_mnemonic_buffer).decode('ascii', errors='replace')
                         self._raw_cmd_mnemonic_buffer = bytearray()
-                        if mnemonic == self.CMD_WRITE_CARD:
-                            if not self._card_available():
-                                logger.info("Write Card: no card available - sending NAK")
-                                response.extend(self._card_disabled_response())
-                                self._state = self._STATE_IDLE
-                            else:
-                                response.extend(self.handle_write_card_init())
-                        elif mnemonic == self.CMD_READ_CARD_PREVIEW:
-                            if not self._card_available():
-                                logger.info("Read Card Preview: no card available - sending NAK")
-                                response.extend(self._card_disabled_response())
-                                self._state = self._STATE_IDLE
-                            else:
-                                self._read_card_preview_params_buffer = bytearray()
-                                self._state = self._STATE_READ_KB_PARAMS
-                        elif mnemonic == self.CMD_READ_CARD_SLOT:
-                            if not self._card_available():
-                                logger.info("Read Card Pattern: no card available - sending NAK")
-                                response.extend(self._card_disabled_response())
-                                self._state = self._STATE_IDLE
-                            else:
-                                self._read_card_slot_params_buffer = bytearray()
-                                self._state = self._STATE_READ_KS_PARAMS
-                        elif mnemonic == self.CMD_DELETE_CARD:
-                            if not self._card_available():
-                                logger.info("Delete Card: no card available - sending NAK")
-                                response.extend(self._card_disabled_response())
-                                self._state = self._STATE_IDLE
-                            else:
-                                self._delete_card_params_buffer = bytearray()
-                                self._state = self._STATE_READ_KL_PARAMS
-                        else:
-                            logger.warning(f"Raw cmd: unknown mnemonic {mnemonic!r} - resetting to idle")
-                            self._state = self._STATE_IDLE
+                        response.extend(self._dispatch_raw_command(mnemonic))
 
             elif self._state == self._STATE_WRITE_MMEMORY_DATA:
                 if byte == self.CTRL_EOT:
@@ -508,6 +472,104 @@ class CommProtocol:
                     self._abort_write_mmemory()
 
         return bytes(response)
+
+    def _handle_idle_byte(self, byte: int) -> bytes:
+        """Process one incoming byte while the state machine is idle.
+
+        Kept as a separate method so that other states can hand a byte over to the
+        idle logic after finishing their own transfer (see
+        _STATE_WRITE_CARD_WAIT_FINAL_ETX).
+        """
+        response = bytearray()
+
+        if byte == self.CTRL_EOT:
+            if self.cmd_buffer:
+                logger.warning(f"Discarding partial buffer on CTRL_EOT: {bytes(self.cmd_buffer)!r}")
+                self.cmd_buffer.clear()
+            self._state = self._STATE_IDLE
+            logger.info("End of transmission")
+        elif byte == self.CTRL_BEL:
+            if self.cmd_buffer:
+                logger.warning(f"Discarding partial buffer on CTRL_BEL: {bytes(self.cmd_buffer)!r}")
+                self.cmd_buffer.clear()
+            response.extend(self.handle_bell_command())
+        elif byte == self.CTRL_ETX:
+            if self.cmd_buffer:
+                cmd_str = self.cmd_buffer.decode('ascii', errors='replace')
+                self.cmd_buffer.clear()
+                response.extend(self._dispatch_text_command(cmd_str))
+            else:
+                # CTRL_ETX with empty buffer is the prefix for a raw command (KN, KB, KL, KS)
+                self._raw_cmd_mnemonic_buffer = bytearray()
+                self._state = self._STATE_RAW_CMD_MNEMONIC
+        else:
+            self.cmd_buffer.append(byte)
+            response.extend(self._dispatch_bare_raw_command())
+
+        return bytes(response)
+
+    def _dispatch_bare_raw_command(self) -> bytes:
+        """Start a raw command whose CTRL_ETX prefix never arrived.
+
+        The CTRL_ETX that ends a card transfer can double as the prefix of the next
+        raw command, so only the 2-character mnemonic reaches the idle text buffer.
+        No text command shares these mnemonics, so a 2-character buffer matching one
+        of them is always a raw command.
+        """
+        if len(self.cmd_buffer) != 2:
+            return b""
+
+        mnemonic = bytes(self.cmd_buffer).decode('ascii', errors='replace')
+        if mnemonic not in self.RAW_CARD_COMMANDS:
+            return b""
+
+        logger.info(f"Raw command {mnemonic!r} received without preceding CTRL_ETX")
+        self.cmd_buffer.clear()
+        return self._dispatch_raw_command(mnemonic)
+
+    def _dispatch_raw_command(self, mnemonic: str) -> bytes:
+        """Start the raw (binary payload) command identified by a 2-character mnemonic.
+
+        Used for both the normal CTRL_ETX-prefixed path (_STATE_RAW_CMD_MNEMONIC) and
+        the prefix-less path (_dispatch_bare_raw_command).
+        """
+        if mnemonic == self.CMD_WRITE_CARD:
+            if not self._card_available():
+                logger.info("Write Card: no card available - sending NAK")
+                self._state = self._STATE_IDLE
+                return self._card_disabled_response()
+            return self.handle_write_card_init()
+
+        if mnemonic == self.CMD_READ_CARD_PREVIEW:
+            if not self._card_available():
+                logger.info("Read Card Preview: no card available - sending NAK")
+                self._state = self._STATE_IDLE
+                return self._card_disabled_response()
+            self._read_card_preview_params_buffer = bytearray()
+            self._state = self._STATE_READ_KB_PARAMS
+            return b""
+
+        if mnemonic == self.CMD_READ_CARD_SLOT:
+            if not self._card_available():
+                logger.info("Read Card Pattern: no card available - sending NAK")
+                self._state = self._STATE_IDLE
+                return self._card_disabled_response()
+            self._read_card_slot_params_buffer = bytearray()
+            self._state = self._STATE_READ_KS_PARAMS
+            return b""
+
+        if mnemonic == self.CMD_DELETE_CARD:
+            if not self._card_available():
+                logger.info("Delete Card: no card available - sending NAK")
+                self._state = self._STATE_IDLE
+                return self._card_disabled_response()
+            self._delete_card_params_buffer = bytearray()
+            self._state = self._STATE_READ_KL_PARAMS
+            return b""
+
+        logger.warning(f"Raw cmd: unknown mnemonic {mnemonic!r} - resetting to idle")
+        self._state = self._STATE_IDLE
+        return b""
 
     def _dispatch_text_command(self, cmd: str) -> bytes:
         """Dispatch a complete text command (stripped of its CTRL_ETX terminator)."""
