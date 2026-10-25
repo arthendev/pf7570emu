@@ -390,9 +390,19 @@ EMBROIDERY_COLOUR_MARK = bytes([0x80, 0x20])
 EMBROIDERY_COLOUR_MARK_A = bytes([0x80, 0x80, 0x2E])
 EMBROIDERY_COLOUR_BLOCK_SIZE = 20
 
-# Payload units (1/10 mm) per canvas unit (1/6 mm), solved from the captures.
-# The feasible interval over all 243 transfers is 1.673207 .. 1.673227.
-EMBROIDERY_SCALE = 1.673217
+# File-name group.  It is optional and sits in front of the preamble:
+#
+#   80 27 <len> <len bytes: name + NUL> 80
+#
+# The outer 0x80 bytes are the block start/end markers, ``27`` is the block id
+# and ``len`` counts the name bytes *including* the null terminator.  An unnamed
+# design therefore is the 5-byte group 80 27 01 00 80.  The machine ignores the
+# group; it only names the design stored on the card.
+EMBROIDERY_NAME_MARK = bytes([0x80, 0x27])
+EMBROIDERY_NAME_END = 0x80
+
+# Embroidery resolution (approx. 1/10 mm) vs. canvas (9mm/MAXI) units (1/6 mm)
+EMBROIDERY_SCALE = 256/153
 
 # Canvas dimensions in canvas units (1/6 mm), used for the preview boundary.
 # Small and large hoop designs share the payload format, so a large-hoop slot
@@ -439,8 +449,30 @@ def _is_colour_block(body: bytes, index: int) -> bool:
             and block[19] == EMBROIDERY_LARGE_ESCAPE)
 
 
+def _read_name_group(data: bytes, index: int):
+    """Parse a ``80 27 <len> <name + NUL> 80`` group at *index*.
+
+    Returns ``(name, next_index)`` where ``next_index`` points just past the
+    block's closing 0x80, or ``None`` when no complete group starts there.
+    ``len`` counts the name bytes including the null terminator, so an unnamed
+    design is ``80 27 01 00 80`` and yields an empty name.
+    """
+    if data[index:index + 2] != EMBROIDERY_NAME_MARK or index + 3 > len(data):
+        return None
+    length = data[index + 2]
+    name_start = index + 3
+    name_end = name_start + length
+    if length < 1 or name_end >= len(data):
+        return None
+    if data[name_end] != EMBROIDERY_NAME_END:
+        return None
+    raw_name = data[name_start:name_end].split(b"\x00", 1)[0]
+    return raw_name.decode("latin-1", errors="replace"), name_end + 1
+
+
 def decode_embroidery_payload(raw_hex: str,
-                              colour_points: Optional[List[int]] = None):
+                              colour_points: Optional[List[int]] = None,
+                              filename_out: Optional[List[str]] = None):
     """Decode an Embroidery card payload into canvas points.
 
     Returns ``(pattern_xy, body_bytes, consumed)`` — an interleaved x/y list in
@@ -453,31 +485,50 @@ def decode_embroidery_payload(raw_hex: str,
     each thread colour section starts (the tie-off point that repeats the last
     stitch of the section that just ended), so callers can colour the preview
     per section.  A single-colour design leaves it empty.
+
+    When ``filename_out`` is given, the design name from the optional file-name
+    group (``80 27 … 80``, normally in front of the preamble) is appended to it;
+    an unnamed design appends an empty string.
     """
     try:
         data = bytes.fromhex((raw_hex or "").strip())
     except (ValueError, AttributeError):
         return [], b"", 0
 
+    # Optional file-name group in front of the preamble.
+    start = 0
+    name_group = _read_name_group(data, 0)
+    if name_group is not None:
+        name, start = name_group
+        if filename_out is not None:
+            filename_out.append(name)
+
     trailer_len = len(EMBROIDERY_TRAILER)
-    if len(data) < EMBROIDERY_HEADER_SIZE + trailer_len:
+    if len(data) - start < EMBROIDERY_HEADER_SIZE + trailer_len:
         return [], b"", 0
-    if not data.startswith(EMBROIDERY_PREAMBLE):
+    if not data.startswith(EMBROIDERY_PREAMBLE, start):
         return [], b"", 0
-    if data[EMBROIDERY_HEADER_SIZE - 2:EMBROIDERY_HEADER_SIZE] != EMBROIDERY_MARK_B:
+    header_end = start + EMBROIDERY_HEADER_SIZE
+    if data[header_end - 2:header_end] != EMBROIDERY_MARK_B:
         return [], b"", 0
 
-    body = data[EMBROIDERY_HEADER_SIZE:len(data) - trailer_len]
+    body = data[header_end:len(data) - trailer_len]
 
-    max_y = _canvas_units_from_payload(int.from_bytes(data[4:6], "little"))
-    max_x = _canvas_units_from_payload(int.from_bytes(data[6:8], "little"))
-    axis0 = int.from_bytes(data[11:13], "big")
-    axis1 = int.from_bytes(data[13:15], "big")
+    max_y = _canvas_units_from_payload(int.from_bytes(data[start + 4:start + 6], "little"))
+    max_x = _canvas_units_from_payload(int.from_bytes(data[start + 6:start + 8], "little"))
+    axis0 = int.from_bytes(data[start + 11:start + 13], "big")
+    axis1 = int.from_bytes(data[start + 13:start + 15], "big")
     values = [(axis0, axis1)]
 
     index = 0
     while index < len(body):
-        if _is_colour_block(body, index):
+        name_group = _read_name_group(body, index)
+        if name_group is not None:
+            # File-name group: metadata, carries no stitch.
+            name, index = name_group
+            if filename_out is not None:
+                filename_out.append(name)
+        elif _is_colour_block(body, index):
             # Colour change: resync to the values the group carries.
             axis0 = int.from_bytes(body[index + 5:index + 7], "big")
             axis1 = int.from_bytes(body[index + 7:index + 9], "big")
@@ -547,6 +598,9 @@ class CardMemorySlot:
     # Point indices at which a new thread colour starts (Embroidery only).
     # Derived from pattern_raw by parse_pattern_data(), so not persisted.
     color_change_points: List[int] = field(default_factory=list)
+    # Design name from the payload's file-name group (Embroidery only).
+    # Derived from pattern_raw by parse_pattern_data(), so not persisted.
+    payload_filename: str = ""
 
     def clear(self) -> None:
         """Remove this slot from its parent CardMemorySpace (if set) and clear data.
@@ -565,6 +619,7 @@ class CardMemorySlot:
         self.pattern_xyt = []
         self.pattern_xytacc = []
         self.color_change_points = []
+        self.payload_filename = ""
         parent = self._parent
         parent.slots.remove(self)
 
@@ -597,6 +652,7 @@ class CardMemorySlot:
         pattern_xyt: List[int] = []
         pattern_xytacc: List[int] = []
         color_change_points: List[int] = []
+        payload_filename = ""
 
         if self.pattern_type == "9mm":
             # Card 9mm encoding: raw is hex bytes. First/last byte may be 0x80/0x8A markers.
@@ -718,8 +774,11 @@ class CardMemorySlot:
         elif self.pattern_type == "Embroidery":
             # Small / large hoop embroidery: decode the card payload into canvas
             # points so the slot gets the same preview and point list as 9mm/MAXI.
+            # The optional file-name group (80 27 … 80) yields the design name.
+            names: List[str] = []
             pattern_xy, body, consumed = decode_embroidery_payload(
-                self.pattern_raw, color_change_points)
+                self.pattern_raw, color_change_points, names)
+            payload_filename = names[0] if names else ""
             pattern_bytes = list(body[:consumed]) if consumed else list(body)
             # Embroidery carries no side transport, so the xyt columns are 0
             # (same convention as 9mm).
@@ -732,6 +791,7 @@ class CardMemorySlot:
         self.pattern_xyt = pattern_xyt
         self.pattern_xytacc = pattern_xytacc
         self.color_change_points = color_change_points
+        self.payload_filename = payload_filename
 
     def get_pattern_stats(self) -> dict:
         """Compute statistics from the pattern data (x,y interleaved).
