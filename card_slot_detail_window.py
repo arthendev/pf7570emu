@@ -577,6 +577,7 @@ class CardSlotDetailWindow(QDialog):
                 27: ("size_pattern",    "size(pattern_raw)"),         # DONE
                 29: ("size_name",       "size(filename)"),            # DONE
             }
+            two_byte_pairs = {7: 8, 9: 10, 11: 12, 13: 14, 15: 16, 17: 18, 20: 21, 24: 25, 27:28}
         elif self.slot.pattern_type== "MAXI":
             mapping = {
                 0: ("fix_0x00",         "Fixed byte?"),               # DONE
@@ -601,6 +602,7 @@ class CardSlotDetailWindow(QDialog):
                 27: ("size_pattern",    "size(pattern_raw)"),         # DONE
                 29: ("size_name",       "size(filename)"),            # DONE
             }
+            two_byte_pairs = {7: 8, 9: 10, 11: 12, 13: 14, 15: 16, 17: 18, 20: 21, 24: 25, 27:28}
 
             # (1) y_min_neg
             #   PCD sometimes sends here different value than y_min_abs (when 
@@ -624,8 +626,8 @@ class CardSlotDetailWindow(QDialog):
                 27: ("size_pattern",    "size(pattern_raw)"),         # DONE
                 29: ("size_name",       "size(filename)"),            # DONE
             }
+            two_byte_pairs = {7: 8, 9: 10, 11: 12, 13: 14, 15: 16, 17: 18, 20: 21, 22: 23, 24: 25, 27:28}
 
-        two_byte_pairs = {7: 8, 9: 10, 11: 12, 13: 14, 15: 16, 17: 18, 20: 21, 24: 25, 27:28}
         skip_indices = set(two_byte_pairs.values())
 
         # Prepare card-specific expected value callables for header bytes
@@ -787,8 +789,8 @@ class CardSlotDetailWindow(QDialog):
         self._header_grid.addItem(
             QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding), grid_row, 0, 1, 7)
 
-    def _populate_pattern_grid(self):
-        """Fill the Pattern tab with all pattern statistics."""
+    def _populate_stats_grid(self):
+        """Fill the Stats tab with all pattern statistics."""
         while self._pattern_grid.count():
             item = self._pattern_grid.takeAt(0)
             if item.widget():
@@ -868,9 +870,9 @@ class CardSlotDetailWindow(QDialog):
             self._pattern_grid.addWidget(lbl, row_idx, 0)
 
             if isinstance(val, bool) or val is None:
-                hex_text = "--"
+                hex_text = "----"
             else:
-                hex_text = f"0x{val & 0xFF:02X}"
+                hex_text = f"0x{val & 0xFFFF:04X}"
             hex_lbl = QLabel(hex_text)
             hex_lbl.setFont(mono)
             self._pattern_grid.addWidget(hex_lbl, row_idx, 1)
@@ -883,7 +885,7 @@ class CardSlotDetailWindow(QDialog):
         self._pattern_grid.addItem(
             QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding), len(rows) + 1, 0, 1, 3)
 
-    def _populate_points_grid(self):
+    def _populate_pattern_grid(self):
         """Fill the Pattern tab with point list: index, (x,y) Dec, (x,y) Hex."""
         data = list(self.slot.pattern_xy)
         xs = data[0::2]
@@ -913,18 +915,18 @@ class CardSlotDetailWindow(QDialog):
             dec_it = QTableWidgetItem(dec_text)
             dec_it.setFont(mono)
 
-            hex_text = f"(0x{xs[i] & 0xFF:02X}, 0x{ys[i] & 0xFF:02X})"
+            hex_text = f"(0x{xs[i] & 0xFFFF:04X}, 0x{ys[i] & 0xFFFF:04X})"
             hex_it = QTableWidgetItem(hex_text)
             hex_it.setFont(mono)
 
             if i == 0:
-                diff_dec_text = "--"
-                diff_hex_text = "--"
+                diff_dec_text = "----"
+                diff_hex_text = "----"
             else:
                 dx = xs[i] - xs[i-1]
                 dy = ys[i] - ys[i-1]
                 diff_dec_text = f"({dx}, {dy})"
-                diff_hex_text = f"(0x{(dx & 0xFF):02X}, 0x{(dy & 0xFF):02X})"
+                diff_hex_text = f"(0x{(dx & 0xFFFF):04X}, 0x{(dy & 0xFFFF):04X})"
 
             diff_dec_it = QTableWidgetItem(diff_dec_text)
             diff_dec_it.setFont(mono)
@@ -1069,8 +1071,8 @@ class CardSlotDetailWindow(QDialog):
         self._update_card_preview()
         self._refresh_raw_display()
         self._populate_header_grid()
+        self._populate_stats_grid()
         self._populate_pattern_grid()
-        self._populate_points_grid()
         self._delete_btn.setEnabled(self.slot.pattern_type != "Empty")
         self._update_nav_buttons()
 

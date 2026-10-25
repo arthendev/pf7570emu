@@ -547,8 +547,8 @@ class SlotDetailWindow(QDialog):
         self._header_grid.addItem(
             QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding), 5, 0, 1, 7)
 
-    def _populate_pattern_grid(self):
-        """Fill the Pattern tab with all pattern statistics."""
+    def _populate_stats_grid(self):
+        """Fill the Stats tab with all pattern statistics."""
         while self._pattern_grid.count():
             item = self._pattern_grid.takeAt(0)
             if item.widget():
@@ -628,9 +628,9 @@ class SlotDetailWindow(QDialog):
             self._pattern_grid.addWidget(lbl, row_idx, 0)
 
             if isinstance(val, bool) or val is None:
-                hex_text = "--"
+                hex_text = "----"
             else:
-                hex_text = f"0x{val & 0xFF:02X}"
+                hex_text = f"0x{val & 0xFFFF:04X}"
             hex_lbl = QLabel(hex_text)
             hex_lbl.setFont(mono)
             self._pattern_grid.addWidget(hex_lbl, row_idx, 1)
@@ -644,7 +644,7 @@ class SlotDetailWindow(QDialog):
             QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding), len(rows) + 1, 0, 1, 3)
 
 
-    def _populate_points_grid(self):
+    def _populate_pattern_grid(self):
         """Fill the Pattern tab with point list: index, (x,y) Dec, (x,y) Hex."""
         # Populate the points table
         data = list(self.slot.pattern_xy)
@@ -815,8 +815,8 @@ class SlotDetailWindow(QDialog):
         self._preview.update()
         self._refresh_raw_display()
         self._populate_header_grid()
+        self._populate_stats_grid()
         self._populate_pattern_grid()
-        self._populate_points_grid()
         self._clear_btn.setEnabled(self.slot.pattern_type != "Empty")
         self._update_nav_buttons()
 
