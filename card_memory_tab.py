@@ -102,8 +102,9 @@ class CardSlotWidget(QFrame):
                 self.slot.preview_raw, self.slot.pattern_type, self._is_embroidery
             )
         else:
-            # Card slots always decode pattern_xy into coordinates.
-            preview = PatternPreview(self.slot.pattern_xy, self.slot.pattern_type,
+            # Card slots always decode pattern_xy into coordinates; Embroidery is
+            # drawn mirrored about its origin (see CardMemorySlot.get_display_xy).
+            preview = PatternPreview(self.slot.get_display_xy(), self.slot.pattern_type,
                                      plot_xy=True)
         right_layout.addWidget(preview)
 
