@@ -343,21 +343,22 @@ class MemorySlot:
 # and relative steps:
 #
 #   0x80 <command>... 0x80      group - 0x80 opens it, a second 0x80 closes it
-#   dA dB                       two signed bytes = relative step (one stitch)
+#   dy dx                       two signed bytes = relative step (one stitch)
 #   0x80 0x2F 0x80              end of design
 #
 # Commands inside a group (the absolute position and the jumps count as
 # stitches, the rest is metadata or a stop the machine only marks):
 #
-#   0x2E aa aa bb bb   absolute A, B (16-bit signed, big-endian) - one stitch
+#   0x2E yy yy xx xx   absolute y, x (16-bit signed, big-endian) - one stitch
 #   0x30..0x3F         colour change, colour number = byte - 0x2F (1..16)
 #   0x20               jump marker - ignored
 #   0x21               may follow 0x2E at a jump - ignored
-#   0x23 dA dB         relative jump - one stitch
+#   0x23 dy dx         relative jump - one stitch
 #   0x25 / 0x26        stop "apply applique" / "cut applique" - ignored
 #   0x27 n ...         title (design name), n bytes including the NUL
-#   0x28 n ...         extra data: 28 05 00 x y = origin (x, y little-endian),
-#                      28 41 01 + 64 bytes = colour table, 16 x (R, G, B, -)
+#   0x28 n ...         extra data: 28 05 00 y x = origin (y first, x second,
+#                      both little-endian); 28 41 01 + 64 bytes = colour
+#                      table, 16 x (R, G, B, -)
 #   0x2A / 0x2B hi lo  extra data with a 16-bit length
 #   0x2F               end of design
 #   0x40..0x43         stop "punching needle" - ignored
@@ -394,7 +395,7 @@ EMBROIDERY_CMD_COLOUR_MAX = 0x3F
 
 # Sub-types of the 0x28 "extra data" command: the first payload byte selects the
 # kind of data, the rest is its body.
-EMBROIDERY_EXTRA_ORIGIN = 0x00          # 28 05 00 x(LE16) y(LE16)
+EMBROIDERY_EXTRA_ORIGIN = 0x00          # 28 05 00 y(LE16) x(LE16)
 EMBROIDERY_EXTRA_COLOUR_TABLE = 0x01    # 28 41 01 + 16 x (R, G, B, -)
 
 # Commands that carry neither a stitch nor data we keep: jump markers, the
@@ -544,12 +545,12 @@ def decode_embroidery_payload(raw_hex: str,
     ``sections_out``      ``(first point index, colour number)`` per colour
                           section, starting with the initial colour
     ``colour_table_out``  the software's colour table, 16 x ``(r, g, b)``
-    ``origin_out``        ``(axis A, axis B)`` from the ``28 05 00`` command, i.e.
-                          the design's top-right corner in protocol units; the
+    ``origin_out``        ``(x, y)`` from the ``28 05 00`` command, i.e. the
+                          design's top-right corner in protocol units; the
                           position values are distances from it towards the
                           bottom-left
-    ``values_out``        the same ``(axis0, axis1)`` payload values per stitch
-                          as ``pattern_xy``, itemised per point
+    ``values_out``        the same ``(x, y)`` values per stitch as
+                          ``pattern_xy``, itemised per point
     """
     try:
         data = bytes.fromhex((raw_hex or "").strip())
@@ -558,10 +559,11 @@ def decode_embroidery_payload(raw_hex: str,
     if not data:
         return [], b"", 0
 
-    # Stitch positions are accumulated in protocol units (1/10 mm): payload axis
-    # 0 is the header's axis A (canvas y), axis 1 its axis B (canvas x).
-    axis0 = 0
-    axis1 = 0
+    # Stitch positions are accumulated in protocol units (1/10 mm).  The payload
+    # writes y before x, so the stream is read as (dy, dx) and kept as (x, y)
+    # from here on.
+    x = 0
+    y = 0
     colour = 1                      # thread colour number in effect (1..16)
     values: List[tuple] = []
     sections: List[tuple] = []
@@ -569,21 +571,21 @@ def decode_embroidery_payload(raw_hex: str,
     colour_table: List[tuple] = []
     origin: Optional[tuple] = None
 
-    def add_point(value_a: int, value_b: int, point_colour: int) -> None:
+    def add_point(x: int, y: int, point_colour: int) -> None:
         """Record one stitch and open a new colour section when it changes."""
-        values.append((value_a, value_b))
+        values.append((x, y))
         if not sections or sections[-1][1] != point_colour:
             sections.append((len(values) - 1, point_colour))
 
     index = 0
     while index < len(data):
         if data[index] != EMBROIDERY_GROUP_MARK:
-            # Plain relative step: two signed bytes, one stitch.
+            # Plain relative step: two signed bytes (dy, dx), one stitch.
             if index + 2 > len(data):
                 break
-            axis0 += _signed_byte(data[index])
-            axis1 += _signed_byte(data[index + 1])
-            add_point(axis0, axis1, colour)
+            y += _signed_byte(data[index])
+            x += _signed_byte(data[index + 1])
+            add_point(x, y, colour)
             index += 2
             continue
 
@@ -598,23 +600,24 @@ def decode_embroidery_payload(raw_hex: str,
         end_of_design = False
         for marker, payload in commands:
             if marker == EMBROIDERY_CMD_ABS_POS:
-                axis0 = _signed_be16(payload, 0)
-                axis1 = _signed_be16(payload, 2)
-                group_points.append((axis0, axis1))
+                y = _signed_be16(payload, 0)
+                x = _signed_be16(payload, 2)
+                group_points.append((x, y))
             elif marker == EMBROIDERY_CMD_REL_JUMP:
-                axis0 += _signed_byte(payload[0])
-                axis1 += _signed_byte(payload[1])
-                group_points.append((axis0, axis1))
+                y += _signed_byte(payload[0])
+                x += _signed_byte(payload[1])
+                group_points.append((x, y))
             elif EMBROIDERY_CMD_COLOUR_MIN <= marker <= EMBROIDERY_CMD_COLOUR_MAX:
                 group_colour = marker - 0x2F
             elif marker == EMBROIDERY_CMD_TITLE:
                 title = payload.split(b"\x00", 1)[0].decode("latin-1", errors="replace")
             elif marker == EMBROIDERY_CMD_EXTRA:
-                # 28 05 00 A B is the design origin (little-endian), the corner
-                # every position is measured from; 28 41 01 is the colour table.
+                # 28 05 00 carries the design origin, the corner every position
+                # is measured from: y first, then x, both little-endian.
+                # 28 41 01 is the colour table.
                 if len(payload) >= 5 and payload[0] == EMBROIDERY_EXTRA_ORIGIN:
-                    origin = (int.from_bytes(payload[1:3], "little"),
-                              int.from_bytes(payload[3:5], "little"))
+                    origin = (int.from_bytes(payload[3:5], "little"),
+                              int.from_bytes(payload[1:3], "little"))
                 elif len(payload) >= 65 and payload[0] == EMBROIDERY_EXTRA_COLOUR_TABLE:
                     table = payload[1:65]
                     colour_table = [tuple(table[i * 4:i * 4 + 3]) for i in range(16)]
@@ -628,16 +631,16 @@ def decode_embroidery_payload(raw_hex: str,
         if group_colour is None:
             group_colour = colour
         colour = group_colour
-        for value_a, value_b in group_points:
-            add_point(value_a, value_b, group_colour)
+        for x, y in group_points:
+            add_point(x, y, group_colour)
         if end_of_design:
             break
 
     # Positions stay exactly as the payload carries them: protocol units (1/10 mm)
     # measured from the design origin.  No canvas-unit conversion and no origin
     # applied — the origin is stored separately and available to the caller.
-    xs = [value_b for _value_a, value_b in values]
-    ys = [value_a for value_a, _value_b in values]
+    xs = [x for x, _y in values]
+    ys = [y for _x, y in values]
 
     # A corrupt payload could push a value below zero, which would break the
     # preview scaling — shift instead.
@@ -697,9 +700,9 @@ class CardMemorySlot:
     # The software's colour table from the 0x28 41 01 command: 16 x (r, g, b),
     # or empty when the design carries no thread colours.
     payload_colour_table: List[tuple] = field(default_factory=list)
-    # Design origin from the 0x28 05 00 command: (axis A, axis B) in protocol
-    # units, i.e. the top-right corner the position values are measured from.
-    # Empty when the payload carries no origin.  Derived from pattern_raw by
+    # Design origin from the 0x28 05 00 command: (x, y) in protocol units, i.e.
+    # the top-right corner the position values are measured from.  Empty when the
+    # payload carries no origin.  Derived from pattern_raw by
     # parse_pattern_data(), so not persisted.
     payload_origin: tuple = ()
 
@@ -925,9 +928,7 @@ class CardMemorySlot:
         points = list(self.pattern_xy)
         if self.pattern_type != "Embroidery" or not self.payload_origin:
             return points
-        # payload_origin is (axis A, axis B) = (y, x) in protocol units.
-        origin_a, origin_b = self.payload_origin
-        origin_x, origin_y = origin_b, origin_a
+        origin_x, origin_y = self.payload_origin
         xs = points[0::2]
         ys = points[1::2]
         display: List[int] = []
@@ -1054,7 +1055,7 @@ class CardMemorySlot:
                 stats["x_min_centered"] = (hoop_size[0] - stats["span_x"]) // 2
                 stats["y_min_centered"] = (hoop_size[1] - stats["span_y"]) // 2
             if self.payload_origin:
-                stats["origin_y"], stats["origin_x"] = self.payload_origin
+                stats["origin_x"], stats["origin_y"] = self.payload_origin
             else:
                 stats["origin_x"] = None
                 stats["origin_y"] = None
