@@ -502,8 +502,6 @@ class CardSlotDetailWindow(QDialog):
     # ------------------------------------------------------------------
 
     def _navigate(self, delta: int):
-        """Switch to an adjacent slot."""
-        # find current index in the slots list using object identity
         try:
             current_idx = next(i for i, s in enumerate(self._slots) if s is self.slot)
         except StopIteration:
@@ -1061,7 +1059,7 @@ class CardSlotDetailWindow(QDialog):
         colour_starts = list(
             getattr(self.slot, "color_change_points", None) or [])
         self._preview.color_change_points = colour_starts
-        self._preview.color_palette = CARD_COLOR_PALETTE if colour_starts else []
+        self._preview.color_palette = self._colour_palette() if colour_starts else []
         # Embroidery is only ever stored on a card; its canvas comes from the
         # hoop the design was made for (small hoop is the only one seen so far).
         self._preview.canvas_size = (EMBROIDERY_CANVAS_SMALL
@@ -1075,6 +1073,21 @@ class CardSlotDetailWindow(QDialog):
         self._populate_points_grid()
         self._delete_btn.setEnabled(self.slot.pattern_type != "Empty")
         self._update_nav_buttons()
+
+    def _colour_palette(self):
+        """Return one QColor per thread-colour section, in section order.
+
+        The payload numbers its colours 1..16 (colour commands 0x30..0x3F), and
+        PCD only supplies real thread colours when it wrote its colour table
+        (0x28 41 01); otherwise the built-in palette stands in for them.
+        """
+        numbers = list(getattr(self.slot, "payload_section_colours", None) or [])
+        table = list(getattr(self.slot, "payload_colour_table", None) or [])
+        base = ([QColor(r, g, b) for r, g, b in table] if len(table) == 16
+                else list(CARD_COLOR_PALETTE))
+        if not numbers:
+            return []
+        return [base[(number - 1) % len(base)] for number in numbers]
 
     def _collect_card_previews(self):
         """List the preview bitmaps stored in the slot.

@@ -338,68 +338,72 @@ class MemorySlot:
 # ---------------------------------------------------------------------------
 # Embroidery (small / large hoop) on-card payload
 # ---------------------------------------------------------------------------
-# The bytes PCD stores in an "Embroidery" card slot are the exact byte
-# stream it sends to the machine, so the transfer format applies unchanged:
+# The bytes PCD stores in an "Embroidery" card slot are the exact stream it
+# sends to the machine.  Everything in that stream is built from command groups
+# and relative steps:
 #
-#   off  0..3   preamble            80 28 05 00
-#   off  4..5   u16 LE  V(max canvas y)     (payload axis 0 is fed by canvas y)
-#   off  6..7   u16 LE  V(max canvas x)     (payload axis 1 is fed by canvas x)
-#   off  8..10  marker              80 80 2E
-#   off 11..12  u16 BE  value of the first point, axis 0
-#   off 13..14  u16 BE  value of the first point, axis 1
-#   off 15..16  marker              30 80
-#   off 17..    body: one record per step
-#   last 3      trailer             80 2F 80
+#   0x80 <command>... 0x80      group - 0x80 opens it, a second 0x80 closes it
+#   dA dB                       two signed bytes = relative step (one stitch)
+#   0x80 0x2F 0x80              end of design
 #
-# A "value" is not a position but the distance from that axis' maximum, already
-# converted to 1/10 mm payload units:
+# Commands inside a group (the absolute position and the jumps count as
+# stitches, the rest is metadata or a stop the machine only marks):
 #
-#   V(i) = trunc(EMBROIDERY_SCALE * (max - coordinate_i))
+#   0x2E aa aa bb bb   absolute A, B (16-bit signed, big-endian) - one stitch
+#   0x30..0x3F         colour change, colour number = byte - 0x2F (1..16)
+#   0x20               jump marker - ignored
+#   0x21               may follow 0x2E at a jump - ignored
+#   0x23 dA dB         relative jump - one stitch
+#   0x25 / 0x26        stop "apply applique" / "cut applique" - ignored
+#   0x27 n ...         title (design name), n bytes including the NUL
+#   0x28 n ...         extra data: 28 05 00 x y = origin (x, y little-endian),
+#                      28 41 01 + 64 bytes = colour table, 16 x (R, G, B, -)
+#   0x2A / 0x2B hi lo  extra data with a 16-bit length
+#   0x2F               end of design
+#   0x40..0x43         stop "punching needle" - ignored
+#   0x01..0x0E         speed limit - ignored
+#   0x24 0x29 0x2C 0x2D  ignored
 #
-# Each body record carries the step to the next point, and the values are
-# differenced, so the receiver accumulates them.
+# Positions are carried as the distance to the design origin, already converted
+# to 1/10 mm payload units, so the receiver accumulates the steps:
 #
-#   small step: 2 bytes, two signed bytes  -> V(i+1) = V(i) + byte
-#   large step: 80 2E <u16 BE> <u16 BE> 80 -> V(i+1) given absolutely
+#   V = trunc(EMBROIDERY_SCALE * distance)
 #
-# The large form is used once a step no longer fits a signed byte, which happens
-# at about 76 canvas units (12.7 mm).  Since small records only ever hold the
-# range -127..127, a leading 0x80 is unambiguously the large form's escape byte.
-EMBROIDERY_PREAMBLE = bytes([0x80, 0x28, 0x05, 0x00])
-EMBROIDERY_MARK_B = bytes([0x30, 0x80])
-EMBROIDERY_LARGE_ESCAPE = 0x80
-EMBROIDERY_LARGE_TAG = 0x2E
-EMBROIDERY_LARGE_SIZE = 7
-EMBROIDERY_TRAILER = bytes([0x80, 0x2F, 0x80])
-EMBROIDERY_HEADER_SIZE = 17
+# The first point, a point that carries a command and any step that no longer
+# fits a signed byte are sent in the absolute 0x2E form, which resyncs the
+# accumulator.
+#
+# Colour: a colour command covers the stitches of its own group and every stitch
+# after it until the next colour command.  PCD writes a change at the last point
+# P of the old colour as
+#
+#   80 20 80 | 80 2E P 80 | 00 00 | 80 2E P 3n 80
+#
+# (jump marker, resync, tie-off stitch, then the change itself); some patterns
+# use the short form 80 2E P 3n 80, where P is already the first point of the new
+# colour.  Both forms are handled by the group walk below.
+EMBROIDERY_GROUP_MARK = 0x80
+EMBROIDERY_CMD_ABS_POS = 0x2E
+EMBROIDERY_CMD_REL_JUMP = 0x23
+EMBROIDERY_CMD_TITLE = 0x27
+EMBROIDERY_CMD_EXTRA = 0x28
+EMBROIDERY_CMD_EXTRA16 = (0x2A, 0x2B)
+EMBROIDERY_CMD_END = 0x2F
+EMBROIDERY_CMD_COLOUR_MIN = 0x30
+EMBROIDERY_CMD_COLOUR_MAX = 0x3F
 
-# Colour change.  Instead of dropping to the usual 2-byte step, the record for
-# the point that follows a colour change is upgraded to this group:
-#
-#   80 20                                 colour-change command
-#   80 80 2E <BE16 Vx> <BE16 Vy> 80        the change point's own values
-#   00 00                                  tie-off stitch (zero movement)
-#   80 2E <BE16 Vx> <BE16 Vy> <30+n> 80    the same pair + section counter
-#
-# The values are exactly Vx/Vy of the change point, i.e. the last stitch of the
-# colour section that just ended, so the receiver resyncs instead of adding a
-# step.  The counter byte is 0x30 + section number, matching the header's own
-# 30 80 terminator.  A colour change after the very first point has no record to
-# upgrade and emits only the tie-off.
-EMBROIDERY_COLOUR_MARK = bytes([0x80, 0x20])
-EMBROIDERY_COLOUR_MARK_A = bytes([0x80, 0x80, 0x2E])
-EMBROIDERY_COLOUR_BLOCK_SIZE = 20
+# Sub-types of the 0x28 "extra data" command: the first payload byte selects the
+# kind of data, the rest is its body.
+EMBROIDERY_EXTRA_ORIGIN = 0x00          # 28 05 00 x(LE16) y(LE16)
+EMBROIDERY_EXTRA_COLOUR_TABLE = 0x01    # 28 41 01 + 16 x (R, G, B, -)
 
-# File-name group.  It is optional and sits in front of the preamble:
-#
-#   80 27 <len> <len bytes: name + NUL> 80
-#
-# The outer 0x80 bytes are the block start/end markers, ``27`` is the block id
-# and ``len`` counts the name bytes *including* the null terminator.  An unnamed
-# design therefore is the 5-byte group 80 27 01 00 80.  The machine ignores the
-# group; it only names the design stored on the card.
-EMBROIDERY_NAME_MARK = bytes([0x80, 0x27])
-EMBROIDERY_NAME_END = 0x80
+# Commands that carry neither a stitch nor data we keep: jump markers, the
+# applique / "punching needle" stops, speed limits and the undocumented ones.
+EMBROIDERY_IGNORED_COMMANDS = frozenset(
+    {0x20, 0x21, 0x24, 0x25, 0x26, 0x29, 0x2C, 0x2D}
+    | set(range(0x01, 0x0F))
+    | set(range(0x40, 0x44))
+)
 
 # Embroidery resolution (approx. 1/10 mm) vs. canvas (9mm/MAXI) units (1/6 mm)
 EMBROIDERY_SCALE = 256/153
@@ -437,132 +441,177 @@ def _canvas_units_from_payload(value: int, scale: float = EMBROIDERY_SCALE) -> i
     return best
 
 
-def _is_colour_block(body: bytes, index: int) -> bool:
-    """True when the 20-byte colour-change group starts at *index*."""
-    end = index + EMBROIDERY_COLOUR_BLOCK_SIZE
-    if end > len(body) or body[index:index + 2] != EMBROIDERY_COLOUR_MARK:
-        return False
-    block = body[index:end]
-    return (block[2:5] == EMBROIDERY_COLOUR_MARK_A
-            and block[9] == EMBROIDERY_LARGE_ESCAPE
-            and 0x30 <= block[18] <= 0x3F
-            and block[19] == EMBROIDERY_LARGE_ESCAPE)
+def _signed_be16(data: bytes, offset: int) -> int:
+    """Read a big-endian 16-bit value at *offset* as a signed number."""
+    value = int.from_bytes(data[offset:offset + 2], "big")
+    return value - 0x10000 if value >= 0x8000 else value
 
 
-def _read_name_group(data: bytes, index: int):
-    """Parse a ``80 27 <len> <name + NUL> 80`` group at *index*.
+def _parse_command_group(data: bytes, index: int):
+    """Parse one ``0x80 ... 0x80`` command group starting at *index*.
 
-    Returns ``(name, next_index)`` where ``next_index`` points just past the
-    block's closing 0x80, or ``None`` when no complete group starts there.
-    ``len`` counts the name bytes including the null terminator, so an unnamed
-    design is ``80 27 01 00 80`` and yields an empty name.
+    Returns ``(commands, next_index)`` where each command is ``(marker, payload)``
+    with the command's data bytes (empty when it carries none) and ``next_index``
+    points just past the closing 0x80.  Returns ``None`` when the group is
+    truncated or holds a command this decoder does not know, so the caller stops
+    instead of inventing stitches.
     """
-    if data[index:index + 2] != EMBROIDERY_NAME_MARK or index + 3 > len(data):
-        return None
-    length = data[index + 2]
-    name_start = index + 3
-    name_end = name_start + length
-    if length < 1 or name_end >= len(data):
-        return None
-    if data[name_end] != EMBROIDERY_NAME_END:
-        return None
-    raw_name = data[name_start:name_end].split(b"\x00", 1)[0]
-    return raw_name.decode("latin-1", errors="replace"), name_end + 1
+    index += 1                      # skip the opening 0x80
+    commands: List[tuple] = []
+    while index < len(data):
+        marker = data[index]
+        if marker == EMBROIDERY_GROUP_MARK:
+            return commands, index + 1
+        if marker == EMBROIDERY_CMD_ABS_POS:
+            if index + 5 > len(data):
+                return None
+            commands.append((marker, data[index + 1:index + 5]))
+            index += 5
+        elif marker == EMBROIDERY_CMD_REL_JUMP:
+            if index + 3 > len(data):
+                return None
+            commands.append((marker, data[index + 1:index + 3]))
+            index += 3
+        elif marker == EMBROIDERY_CMD_TITLE or marker == EMBROIDERY_CMD_EXTRA:
+            if index + 2 > len(data):
+                return None
+            end = index + 2 + data[index + 1]
+            if end > len(data):
+                return None
+            commands.append((marker, data[index + 2:end]))
+            index = end
+        elif marker in EMBROIDERY_CMD_EXTRA16:
+            if index + 3 > len(data):
+                return None
+            end = index + 3 + int.from_bytes(data[index + 1:index + 3], "big")
+            if end > len(data):
+                return None
+            commands.append((marker, data[index + 3:end]))
+            index = end
+        elif (EMBROIDERY_CMD_COLOUR_MIN <= marker <= EMBROIDERY_CMD_COLOUR_MAX
+              or marker == EMBROIDERY_CMD_END):
+            commands.append((marker, b""))
+            index += 1
+        elif marker in EMBROIDERY_IGNORED_COMMANDS:
+            index += 1
+        else:
+            return None
+    return None                     # the group never closed
 
 
 def decode_embroidery_payload(raw_hex: str,
                               colour_points: Optional[List[int]] = None,
-                              filename_out: Optional[List[str]] = None):
+                              filename_out: Optional[List[str]] = None,
+                              sections_out: Optional[List[tuple]] = None,
+                              colour_table_out: Optional[List[tuple]] = None):
     """Decode an Embroidery card payload into canvas points.
 
-    Returns ``(pattern_xy, body_bytes, consumed)`` — an interleaved x/y list in
-    canvas units (1/6 mm), the raw step records, and how many body bytes the
-    walk understood.  ``pattern_xy`` is empty when the payload cannot be decoded;
-    ``consumed < len(body_bytes)`` means an unknown record stopped the walk, so
-    the returned geometry is only the leading part of the design.
+    Returns ``(pattern_xy, data, consumed)`` — an interleaved x/y list in canvas
+    units (1/6 mm), the payload bytes and how many of them the walk understood.
+    ``pattern_xy`` is empty when nothing could be decoded; ``consumed < len(data)``
+    means an unknown command stopped the walk, so the returned geometry is only
+    the leading part of the design.
 
-    When ``colour_points`` is given it is filled with the point index at which
-    each thread colour section starts (the tie-off point that repeats the last
-    stitch of the section that just ended), so callers can colour the preview
-    per section.  A single-colour design leaves it empty.
+    Optional out-parameters (appended to, so they stay untouched when the payload
+    carries nothing of that kind):
 
-    When ``filename_out`` is given, the design name from the optional file-name
-    group (``80 27 … 80``, normally in front of the preamble) is appended to it;
-    an unnamed design appends an empty string.
+    ``colour_points``     point indices at which a new thread colour starts
+    ``filename_out``      the title command's name ('' when the design is unnamed)
+    ``sections_out``      ``(first point index, colour number)`` per colour
+                          section, starting with the initial colour
+    ``colour_table_out``  the software's colour table, 16 x ``(r, g, b)``
     """
     try:
         data = bytes.fromhex((raw_hex or "").strip())
     except (ValueError, AttributeError):
         return [], b"", 0
-
-    # Optional file-name group in front of the preamble.
-    start = 0
-    name_group = _read_name_group(data, 0)
-    if name_group is not None:
-        name, start = name_group
-        if filename_out is not None:
-            filename_out.append(name)
-
-    trailer_len = len(EMBROIDERY_TRAILER)
-    if len(data) - start < EMBROIDERY_HEADER_SIZE + trailer_len:
-        return [], b"", 0
-    if not data.startswith(EMBROIDERY_PREAMBLE, start):
-        return [], b"", 0
-    header_end = start + EMBROIDERY_HEADER_SIZE
-    if data[header_end - 2:header_end] != EMBROIDERY_MARK_B:
+    if not data:
         return [], b"", 0
 
-    body = data[header_end:len(data) - trailer_len]
+    # Design origin in payload units (0x28 05 command).  Payload axis 0 is fed by
+    # the canvas y and axis 1 by the canvas x, as in the transfer protocol.
+    origin_a = 0
+    origin_b = 0
+    axis0 = 0
+    axis1 = 0
+    colour = 1                      # thread colour number in effect (1..16)
+    values: List[tuple] = []
+    sections: List[tuple] = []
+    title = ""
+    colour_table: List[tuple] = []
 
-    max_y = _canvas_units_from_payload(int.from_bytes(data[start + 4:start + 6], "little"))
-    max_x = _canvas_units_from_payload(int.from_bytes(data[start + 6:start + 8], "little"))
-    axis0 = int.from_bytes(data[start + 11:start + 13], "big")
-    axis1 = int.from_bytes(data[start + 13:start + 15], "big")
-    values = [(axis0, axis1)]
+    def add_point(value_a: int, value_b: int, point_colour: int) -> None:
+        """Record one stitch and open a new colour section when it changes."""
+        values.append((value_a, value_b))
+        if not sections or sections[-1][1] != point_colour:
+            sections.append((len(values) - 1, point_colour))
 
     index = 0
-    while index < len(body):
-        name_group = _read_name_group(body, index)
-        if name_group is not None:
-            # File-name group: metadata, carries no stitch.
-            name, index = name_group
-            if filename_out is not None:
-                filename_out.append(name)
-        elif _is_colour_block(body, index):
-            # Colour change: resync to the values the group carries.
-            axis0 = int.from_bytes(body[index + 5:index + 7], "big")
-            axis1 = int.from_bytes(body[index + 7:index + 9], "big")
-            if colour_points is not None:
-                # The tie-off point repeats the last stitch of the section that
-                # just ended; the stitches after it use the next thread colour.
-                colour_points.append(len(values))
-            values.append((axis0, axis1))
-            index += EMBROIDERY_COLOUR_BLOCK_SIZE
-        elif (body[index] == EMBROIDERY_LARGE_ESCAPE
-                and body[index + 1:index + 2] == bytes([EMBROIDERY_LARGE_TAG])
-                and index + EMBROIDERY_LARGE_SIZE <= len(body)):
-            # The large form carries the destination point's values absolutely,
-            # so the accumulator must resync to them (the following small steps
-            # continue from here).
-            axis0 = int.from_bytes(body[index + 2:index + 4], "big")
-            axis1 = int.from_bytes(body[index + 4:index + 6], "big")
-            values.append((axis0, axis1))
-            index += EMBROIDERY_LARGE_SIZE
-        elif body[index] != EMBROIDERY_LARGE_ESCAPE and index + 2 <= len(body):
-            axis0 += _signed_byte(body[index])
-            axis1 += _signed_byte(body[index + 1])
-            values.append((axis0, axis1))
+    while index < len(data):
+        if data[index] != EMBROIDERY_GROUP_MARK:
+            # Plain relative step: two signed bytes, one stitch.
+            if index + 2 > len(data):
+                break
+            axis0 += _signed_byte(data[index])
+            axis1 += _signed_byte(data[index + 1])
+            add_point(axis0, axis1, colour)
             index += 2
-        else:
-            # Unknown record shape — stop rather than invent points.
+            continue
+
+        parsed = _parse_command_group(data, index)
+        if parsed is None:
+            # Unknown or truncated group: stop rather than invent stitches.
+            break
+        commands, index = parsed
+
+        group_colour = None
+        group_points: List[tuple] = []
+        end_of_design = False
+        for marker, payload in commands:
+            if marker == EMBROIDERY_CMD_ABS_POS:
+                axis0 = _signed_be16(payload, 0)
+                axis1 = _signed_be16(payload, 2)
+                group_points.append((axis0, axis1))
+            elif marker == EMBROIDERY_CMD_REL_JUMP:
+                axis0 += _signed_byte(payload[0])
+                axis1 += _signed_byte(payload[1])
+                group_points.append((axis0, axis1))
+            elif EMBROIDERY_CMD_COLOUR_MIN <= marker <= EMBROIDERY_CMD_COLOUR_MAX:
+                group_colour = marker - 0x2F
+            elif marker == EMBROIDERY_CMD_TITLE:
+                title = payload.split(b"\x00", 1)[0].decode("latin-1", errors="replace")
+            elif marker == EMBROIDERY_CMD_EXTRA:
+                if len(payload) == 5 and payload[0] == EMBROIDERY_EXTRA_ORIGIN:
+                    # Origin given in payload units; keep it in canvas units so it
+                    # can be compared with the converted stitch positions.
+                    origin_a = _canvas_units_from_payload(
+                        int.from_bytes(payload[1:3], "little"))
+                    origin_b = _canvas_units_from_payload(
+                        int.from_bytes(payload[3:5], "little"))
+                elif len(payload) >= 65 and payload[0] == EMBROIDERY_EXTRA_COLOUR_TABLE:
+                    table = payload[1:65]
+                    colour_table = [tuple(table[i * 4:i * 4 + 3]) for i in range(16)]
+            elif marker == EMBROIDERY_CMD_END:
+                end_of_design = True
+
+        # A colour command also covers the stitches of its own group: in the
+        # short form "80 2E P 3n 80" P is already the first point of the new
+        # colour, while in the long form the change has a group of its own and
+        # the preceding groups keep the old colour.
+        if group_colour is None:
+            group_colour = colour
+        colour = group_colour
+        for value_a, value_b in group_points:
+            add_point(value_a, value_b, group_colour)
+        if end_of_design:
             break
 
     xs, ys = [], []
-    for v_axis0, v_axis1 in values:
-        ys.append(max_y - _canvas_units_from_payload(v_axis0))
-        xs.append(max_x - _canvas_units_from_payload(v_axis1))
+    for value_a, value_b in values:
+        ys.append(origin_a - _canvas_units_from_payload(value_a))
+        xs.append(origin_b - _canvas_units_from_payload(value_b))
 
-    # Canvas coordinates are non-negative.  A corrupt header could push a point
+    # Canvas coordinates are non-negative.  A corrupt origin could push a point
     # below zero, which would break the preview scaling — shift instead.
     if xs and min(xs) < 0:
         shift = -min(xs)
@@ -574,7 +623,16 @@ def decode_embroidery_payload(raw_hex: str,
     pattern_xy: List[int] = []
     for x, y in zip(xs, ys):
         pattern_xy.extend([int(x), int(y)])
-    return pattern_xy, body, index
+
+    if colour_points is not None:
+        colour_points.extend(start for start, _number in sections[1:])
+    if sections_out is not None:
+        sections_out.extend(sections)
+    if filename_out is not None:
+        filename_out.append(title)
+    if colour_table_out is not None:
+        colour_table_out.extend(colour_table)
+    return pattern_xy, data, index
 
 
 @dataclass
@@ -601,6 +659,12 @@ class CardMemorySlot:
     # Design name from the payload's file-name group (Embroidery only).
     # Derived from pattern_raw by parse_pattern_data(), so not persisted.
     payload_filename: str = ""
+    # Colour number (1..16) of each colour section, starting with the initial
+    # colour.  len(payload_section_colours) == len(color_change_points) + 1.
+    payload_section_colours: List[int] = field(default_factory=list)
+    # The software's colour table from the 0x28 41 01 command: 16 x (r, g, b),
+    # or empty when the design carries no thread colours.
+    payload_colour_table: List[tuple] = field(default_factory=list)
 
     def clear(self) -> None:
         """Remove this slot from its parent CardMemorySpace (if set) and clear data.
@@ -620,6 +684,8 @@ class CardMemorySlot:
         self.pattern_xytacc = []
         self.color_change_points = []
         self.payload_filename = ""
+        self.payload_section_colours = []
+        self.payload_colour_table = []
         parent = self._parent
         parent.slots.remove(self)
 
@@ -644,7 +710,7 @@ class CardMemorySlot:
 
         9mm:  groups of 2 bytes — dx (with 0x5B offset) and y absolute
         MAXI: groups of 3 bytes — dy_acc transport (with 0xC6 offset), dx (with 0x5B offset), and y absolute;
-        Embroidery (Small hoop / Large hoop): the on-card payload is the byte stream PC-Designer
+        Embroidery (Small hoop / Large hoop): the on-card payload is the byte stream PCD
             sends to the machine, decoded by decode_embroidery_payload() into canvas units (1/6 mm).
         """
         pattern_bytes: List[int] = []
@@ -653,6 +719,8 @@ class CardMemorySlot:
         pattern_xytacc: List[int] = []
         color_change_points: List[int] = []
         payload_filename = ""
+        section_colours: List[int] = []
+        colour_table: List[tuple] = []
 
         if self.pattern_type == "9mm":
             # Card 9mm encoding: raw is hex bytes. First/last byte may be 0x80/0x8A markers.
@@ -774,11 +842,16 @@ class CardMemorySlot:
         elif self.pattern_type == "Embroidery":
             # Small / large hoop embroidery: decode the card payload into canvas
             # points so the slot gets the same preview and point list as 9mm/MAXI.
-            # The optional file-name group (80 27 … 80) yields the design name.
+            # The title command (0x27) yields the design name, the colour
+            # commands (0x30..0x3F) the colour sections and 0x28 41 01 the
+            # software colour table.
             names: List[str] = []
+            sections: List[tuple] = []
             pattern_xy, body, consumed = decode_embroidery_payload(
-                self.pattern_raw, color_change_points, names)
+                self.pattern_raw, color_change_points, names, sections,
+                colour_table)
             payload_filename = names[0] if names else ""
+            section_colours = [number for _start, number in sections]
             pattern_bytes = list(body[:consumed]) if consumed else list(body)
             # Embroidery carries no side transport, so the xyt columns are 0
             # (same convention as 9mm).
@@ -792,6 +865,8 @@ class CardMemorySlot:
         self.pattern_xytacc = pattern_xytacc
         self.color_change_points = color_change_points
         self.payload_filename = payload_filename
+        self.payload_section_colours = section_colours
+        self.payload_colour_table = colour_table
 
     def get_pattern_stats(self) -> dict:
         """Compute statistics from the pattern data (x,y interleaved).
