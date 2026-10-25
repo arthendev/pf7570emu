@@ -43,6 +43,14 @@ CARD_COLOR_PALETTE = [
     QColor(0, 0, 0),        # 16 black
 ]
 
+# Header two-byte groupings: high byte -> low byte, shared by the Header tab and
+# the "Logical split" display of the raw header.  9mm and MAXI carry two
+# unrelated single-byte values in bytes 22 and 23, so those stay apart;
+# Embroidery has one 16-bit value there (x_min_centered).
+HEADER_TWO_BYTE_PAIRS = {7: 8, 9: 10, 11: 12, 13: 14,
+                         15: 16, 17: 18, 20: 21, 24: 25, 27: 28}
+HEADER_TWO_BYTE_PAIRS_EMBROIDERY = {**HEADER_TWO_BYTE_PAIRS, 22: 23}
+
 
 class CardPatternPreview(PatternPreview):
     """Stitch-path preview that colours each thread-colour section.
@@ -577,7 +585,7 @@ class CardSlotDetailWindow(QDialog):
                 27: ("size_pattern",    "size(pattern_raw)"),         # DONE
                 29: ("size_name",       "size(filename)"),            # DONE
             }
-            two_byte_pairs = {7: 8, 9: 10, 11: 12, 13: 14, 15: 16, 17: 18, 20: 21, 24: 25, 27:28}
+            two_byte_pairs = HEADER_TWO_BYTE_PAIRS
         elif self.slot.pattern_type== "MAXI":
             mapping = {
                 0: ("fix_0x00",         "Fixed byte?"),               # DONE
@@ -602,7 +610,7 @@ class CardSlotDetailWindow(QDialog):
                 27: ("size_pattern",    "size(pattern_raw)"),         # DONE
                 29: ("size_name",       "size(filename)"),            # DONE
             }
-            two_byte_pairs = {7: 8, 9: 10, 11: 12, 13: 14, 15: 16, 17: 18, 20: 21, 24: 25, 27:28}
+            two_byte_pairs = HEADER_TWO_BYTE_PAIRS
 
             # (1) y_min_neg
             #   PCD sometimes sends here different value than y_min_abs (when 
@@ -635,7 +643,7 @@ class CardSlotDetailWindow(QDialog):
                 27: ("size_pattern",    "size(pattern_raw)"),         # DONE
                 29: ("size_name",       "size(filename)"),            # DONE
             }
-            two_byte_pairs = {7: 8, 9: 10, 11: 12, 13: 14, 15: 16, 17: 18, 20: 21, 22: 23, 24: 25, 27:28}
+            two_byte_pairs = HEADER_TWO_BYTE_PAIRS_EMBROIDERY
 
         skip_indices = set(two_byte_pairs.values())
 
@@ -1215,8 +1223,11 @@ class CardSlotDetailWindow(QDialog):
         if not bytes_list:
             return raw
 
-        # Header two-byte grouping as used in header analysis
-        two_byte_pairs = {7: 8, 9: 10, 11: 12, 13: 14, 15: 16, 17: 18, 20: 21, 22: 23, 24: 25, 27: 28}
+        # Header two-byte grouping as used in the header analysis; 9mm and MAXI
+        # keep bytes 22 and 23 apart, Embroidery groups them.
+        two_byte_pairs = (HEADER_TWO_BYTE_PAIRS_EMBROIDERY
+                          if self.slot.pattern_type == "Embroidery"
+                          else HEADER_TWO_BYTE_PAIRS)
         skip_indices = set(two_byte_pairs.values())
 
         parts = []
