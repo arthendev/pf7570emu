@@ -408,37 +408,17 @@ EMBROIDERY_IGNORED_COMMANDS = frozenset(
 # Embroidery resolution (approx. 1/10 mm) vs. canvas (9mm/MAXI) units (1/6 mm)
 EMBROIDERY_SCALE = 256/153
 
-# Canvas dimensions in canvas units (1/6 mm), used for the preview boundary.
+# Hoop dimensions in canvas units (1/6 mm); the header only has a code for
+# them, so the slot converts them to protocol units for the preview frame.
 # Small and large hoop designs share the payload format, so a large-hoop slot
 # cannot be recognised from the payload alone.
 EMBROIDERY_CANVAS_SMALL = (480, 480)
-EMBROIDERY_CANVAS_LARGE = (720, 690)     # reference only, not selectable yet
+EMBROIDERY_CANVAS_LARGE = (720, 690)
 
 
 def _signed_byte(value: int) -> int:
     """Interpret a 0..255 byte as a signed value."""
     return value - 256 if value >= 128 else value
-
-
-def _canvas_units_from_payload(value: int, scale: float = EMBROIDERY_SCALE) -> int:
-    """Invert ``V = trunc(scale * distance)`` and return the canvas distance.
-
-    ``distance`` is a non-negative integer and ``scale`` > 1, so ``trunc`` steps
-    by 1 or 2 and every payload value that the encoder can produce maps back to
-    exactly one distance.  Values that are unreachable (i.e. a corrupt payload)
-    fall back to the nearest candidate.
-    """
-    if value <= 0:
-        return 0
-    guess = int(value / scale)
-    best, best_error = 0, None
-    for candidate in range(max(0, guess - 1), guess + 3):
-        error = abs(int(scale * candidate) - value)
-        if best_error is None or error < best_error:
-            best, best_error = candidate, error
-        if error == 0:
-            break
-    return best
 
 
 def _signed_be16(data: bytes, offset: int) -> int:
@@ -503,14 +483,15 @@ def decode_embroidery_payload(raw_hex: str,
                               colour_points: Optional[List[int]] = None,
                               filename_out: Optional[List[str]] = None,
                               sections_out: Optional[List[tuple]] = None,
-                              colour_table_out: Optional[List[tuple]] = None):
-    """Decode an Embroidery card payload into canvas points.
+                              colour_table_out: Optional[List[tuple]] = None,
+                              values_out: Optional[List[tuple]] = None):
+    """Decode an Embroidery card payload into protocol-unit points.
 
-    Returns ``(pattern_xy, data, consumed)`` — an interleaved x/y list in canvas
-    units (1/6 mm), the payload bytes and how many of them the walk understood.
-    ``pattern_xy`` is empty when nothing could be decoded; ``consumed < len(data)``
-    means an unknown command stopped the walk, so the returned geometry is only
-    the leading part of the design.
+    Returns ``(pattern_xy, data, consumed)`` — an interleaved x/y list in
+    protocol units (1/10 mm), the payload bytes and how many of them the walk
+    understood.  ``pattern_xy`` is empty when nothing could be decoded;
+    ``consumed < len(data)`` means an unknown command stopped the walk, so the
+    returned geometry is only the leading part of the design.
 
     Optional out-parameters (appended to, so they stay untouched when the payload
     carries nothing of that kind):
@@ -520,6 +501,8 @@ def decode_embroidery_payload(raw_hex: str,
     ``sections_out``      ``(first point index, colour number)`` per colour
                           section, starting with the initial colour
     ``colour_table_out``  the software's colour table, 16 x ``(r, g, b)``
+    ``values_out``        the raw ``(axis0, axis1)`` payload values per stitch,
+                          i.e. the design positions in protocol units
     """
     try:
         data = bytes.fromhex((raw_hex or "").strip())
@@ -528,10 +511,8 @@ def decode_embroidery_payload(raw_hex: str,
     if not data:
         return [], b"", 0
 
-    # Design origin in payload units (0x28 05 command).  Payload axis 0 is fed by
-    # the canvas y and axis 1 by the canvas x, as in the transfer protocol.
-    origin_a = 0
-    origin_b = 0
+    # Stitch positions are accumulated in protocol units (1/10 mm): payload axis
+    # 0 is the header's axis A (canvas y), axis 1 its axis B (canvas x).
     axis0 = 0
     axis1 = 0
     colour = 1                      # thread colour number in effect (1..16)
@@ -581,14 +562,9 @@ def decode_embroidery_payload(raw_hex: str,
             elif marker == EMBROIDERY_CMD_TITLE:
                 title = payload.split(b"\x00", 1)[0].decode("latin-1", errors="replace")
             elif marker == EMBROIDERY_CMD_EXTRA:
-                if len(payload) == 5 and payload[0] == EMBROIDERY_EXTRA_ORIGIN:
-                    # Origin given in payload units; keep it in canvas units so it
-                    # can be compared with the converted stitch positions.
-                    origin_a = _canvas_units_from_payload(
-                        int.from_bytes(payload[1:3], "little"))
-                    origin_b = _canvas_units_from_payload(
-                        int.from_bytes(payload[3:5], "little"))
-                elif len(payload) >= 65 and payload[0] == EMBROIDERY_EXTRA_COLOUR_TABLE:
+                # 28 05 00 x y is the design origin, which the positions below
+                # already carry, so only the colour table is of interest here.
+                if len(payload) >= 65 and payload[0] == EMBROIDERY_EXTRA_COLOUR_TABLE:
                     table = payload[1:65]
                     colour_table = [tuple(table[i * 4:i * 4 + 3]) for i in range(16)]
             elif marker == EMBROIDERY_CMD_END:
@@ -606,13 +582,14 @@ def decode_embroidery_payload(raw_hex: str,
         if end_of_design:
             break
 
-    xs, ys = [], []
-    for value_a, value_b in values:
-        ys.append(origin_a - _canvas_units_from_payload(value_a))
-        xs.append(origin_b - _canvas_units_from_payload(value_b))
+    # Positions stay in protocol units (1/10 mm) — no conversion to canvas units
+    # (1/6 mm) happens here, so every statistic derived from them matches the
+    # pattern header directly.
+    xs = [value_b for _value_a, value_b in values]
+    ys = [value_a for value_a, _value_b in values]
 
-    # Canvas coordinates are non-negative.  A corrupt origin could push a point
-    # below zero, which would break the preview scaling — shift instead.
+    # A corrupt payload could push a value below zero, which would break the
+    # preview scaling — shift instead.
     if xs and min(xs) < 0:
         shift = -min(xs)
         xs = [x + shift for x in xs]
@@ -632,6 +609,8 @@ def decode_embroidery_payload(raw_hex: str,
         filename_out.append(title)
     if colour_table_out is not None:
         colour_table_out.extend(colour_table)
+    if values_out is not None:
+        values_out.extend(values)
     return pattern_xy, data, index
 
 
@@ -711,7 +690,8 @@ class CardMemorySlot:
         9mm:  groups of 2 bytes — dx (with 0x5B offset) and y absolute
         MAXI: groups of 3 bytes — dy_acc transport (with 0xC6 offset), dx (with 0x5B offset), and y absolute;
         Embroidery (Small hoop / Large hoop): the on-card payload is the byte stream PCD
-            sends to the machine, decoded by decode_embroidery_payload() into canvas units (1/6 mm).
+            sends to the machine, decoded by decode_embroidery_payload() into protocol
+            units (1/10 mm) so the statistics match the pattern header directly.
         """
         pattern_bytes: List[int] = []
         pattern_xy: List[int] = []
@@ -840,11 +820,11 @@ class CardMemorySlot:
                     pattern_xy.extend([int(x), int(y)])
 
         elif self.pattern_type == "Embroidery":
-            # Small / large hoop embroidery: decode the card payload into canvas
-            # points so the slot gets the same preview and point list as 9mm/MAXI.
-            # The title command (0x27) yields the design name, the colour
-            # commands (0x30..0x3F) the colour sections and 0x28 41 01 the
-            # software colour table.
+            # Small / large hoop embroidery: decode the card payload into
+            # protocol-unit points so the slot gets the same preview and point
+            # list as 9mm/MAXI.  The title command (0x27) yields the design
+            # name, the colour commands (0x30..0x3F) the colour sections and
+            # 0x28 41 01 the software colour table.
             names: List[str] = []
             sections: List[tuple] = []
             pattern_xy, body, consumed = decode_embroidery_payload(
@@ -868,6 +848,27 @@ class CardMemorySlot:
         self.payload_section_colours = section_colours
         self.payload_colour_table = colour_table
 
+    def _hoop_units(self) -> Optional[tuple]:
+        """Hoop size (width, height) in protocol units from header byte [19].
+
+        Returns ``None`` when the header carries no known hoop code
+        (1 = small hoop, 2 = large hoop).
+        """
+        raw_header = (self.header_raw or "").strip()
+        if len(raw_header) < 40:
+            return None
+        try:
+            hoop = int(raw_header[38:40], 16)
+        except ValueError:
+            return None
+        if hoop == 1:
+            width, height = EMBROIDERY_CANVAS_SMALL
+        elif hoop == 2:
+            width, height = EMBROIDERY_CANVAS_LARGE
+        else:
+            return None
+        return int(width * EMBROIDERY_SCALE), int(height * EMBROIDERY_SCALE)
+
     def get_pattern_stats(self) -> dict:
         """Compute statistics from the pattern data (x,y interleaved).
 
@@ -885,6 +886,10 @@ class CardMemorySlot:
             "y_min_to_bound": None,  # 0x36 - y_min
             "y_min_symmetry": None,  # this one is tricky; used for memory card upload
             "span_x": None, "span_y": None,
+            # Embroidery only: the hoop from header byte [19] and the centring
+            # margins PCD derives from it, all in protocol units.
+            "hoop_x": None, "hoop_y": None,
+            "min_x": None, "min_y": None,
             "dx_max": None, "dx_min": None,
             "dx_min_abs": None, "dx_abs_max": None,
             "dy_max": None, "dy_min": None,
@@ -951,6 +956,15 @@ class CardMemorySlot:
 
         stats["span_x"] = stats["x_max"] - stats["x_min"]
         stats["span_y"] = stats["y_max"] - stats["y_min"]
+
+        # Embroidery: header byte [19] names the hoop, so the frame the design
+        # sits in and the centring margins PCD writes follow in the same unit.
+        hoop = self._hoop_units() if self.pattern_type == "Embroidery" else None
+        if hoop is not None:
+            stats["hoop_x"], stats["hoop_y"] = hoop
+            stats["min_y"] = (hoop[1] - stats["span_y"]) // 2
+            stats["min_x"] = (hoop[0] - stats["span_x"]) // 2
+
         if len(xs) > 1:
             dxs = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
             dys = [ys[i + 1] - ys[i] for i in range(len(ys) - 1)]

@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import QShortcut
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtGui import QFont, QColor, QPainter, QPen, QBrush
 
-from machine_state import MemorySlot, EMBROIDERY_CANVAS_SMALL
+from machine_state import MemorySlot
 from pmemory_tab import PatternPreview
 from preview_render import CardPreviewImage, split_preview_blocks
 
@@ -621,14 +621,27 @@ class CardSlotDetailWindow(QDialog):
                 4: ("fix_0xC0",         "Fixed byte?"),               # DONE
                 5: ("fix_0x00",         "Fixed byte?"),               # DONE
                 6: ("type",             "Pattern type"),              # DONE
+                7: ("p0_y",             "ys[0]"),                     # DONE
+                9: ("pn_y",             "ys[-1]"),                    # DONE
+                11: ("span_y",          "max(ys) - min(ys)"),         # DONE
+                13: ("p0_x",            "xs[0]"),                     # DONE
+                15: ("span_x",          "max(xs) - min(xs)"),         # DONE
+                17: ("colour_mask",     "colour mask, bit n = colour n+1"),  # DONE
+                19: ("hoop_type",       "1 = small hoop, 2 = large hoop"),   # DONE
+                20: ("min_y",           "min(ys)"),
+                22: ("min_x",           "min(xs)"),
                 24: ("size_preview",    "Fixed 288"),                 # DONE
-                26: ("n_colors",        "size(preview_raw)//preview_size"),
+                26: ("n_colors",        "size(preview_raw)//preview_size"),  # DONE
                 27: ("size_pattern",    "size(pattern_raw)"),         # DONE
                 29: ("size_name",       "size(filename)"),            # DONE
             }
             two_byte_pairs = {7: 8, 9: 10, 11: 12, 13: 14, 15: 16, 17: 18, 20: 21, 22: 23, 24: 25, 27:28}
 
         skip_indices = set(two_byte_pairs.values())
+
+        # Header fields that describe the design but have no counterpart in the
+        # decoded payload, so they are shown with their meaning only.
+        info_only_keys = {"colour_mask", "hoop_type"}
 
         # Prepare card-specific expected value callables for header bytes
         ptype = self.slot.pattern_type
@@ -733,8 +746,11 @@ class CardSlotDetailWindow(QDialog):
 
                 stat_key, stat_label = mapping[idx] if idx in mapping else (None, "")
                 
-                # Default from pattern stats when available
-                stat_val_raw = stats.get(stat_key) if stat_key else None
+                # Statistics of the same name; Embroidery keeps them in the
+                # protocol units the header itself uses.
+                stat_val_raw = None
+                if stat_key is not None and stat_key not in info_only_keys:
+                    stat_val_raw = stats.get(stat_key)
 
                 # Special computed sizes come from slot fields (pattern_raw, preview_raw, filename)
                 if stat_key == 'size_pattern':
@@ -761,8 +777,11 @@ class CardSlotDetailWindow(QDialog):
 
                 stat_key, stat_label = mapping[idx] if idx in mapping else (None, "")
                 
-                # Default from pattern stats when available
-                stat_val_raw = stats.get(stat_key) if stat_key else None
+                # Statistics of the same name; Embroidery keeps them in the
+                # protocol units the header itself uses.
+                stat_val_raw = None
+                if stat_key is not None and stat_key not in info_only_keys:
+                    stat_val_raw = stats.get(stat_key)
 
                 # Special computed sizes come from slot fields (pattern_raw, preview_raw, filename)
                 if stat_key == 'size_pattern':
@@ -1054,7 +1073,7 @@ class CardSlotDetailWindow(QDialog):
         ptype = self.slot.pattern_type
         if ptype in ("9mm", "MAXI", "Embroidery"):
             self.slot.parse_pattern_data()
-        self._preview.pattern_xy = list(self.slot.pattern_xy)
+        self._preview.pattern_xy = self._display_xy()
         self._preview.pattern_type = self.slot.pattern_type
         # Thread-colour sections come from the decoded payload (Embroidery only);
         # other pattern types stay single-colour and keep the default preview pen.
@@ -1062,11 +1081,8 @@ class CardSlotDetailWindow(QDialog):
             getattr(self.slot, "color_change_points", None) or [])
         self._preview.color_change_points = colour_starts
         self._preview.color_palette = self._colour_palette() if colour_starts else []
-        # Embroidery is only ever stored on a card; its canvas comes from the
-        # hoop the design was made for (small hoop is the only one seen so far).
-        self._preview.canvas_size = (EMBROIDERY_CANVAS_SMALL
-                                     if self.slot.pattern_type == "Embroidery"
-                                     else None)
+        # The Embroidery canvas is the hoop the design was made for.
+        self._preview.canvas_size = self._display_canvas()
         self._preview.update()
         self._update_card_preview()
         self._refresh_raw_display()
@@ -1075,6 +1091,37 @@ class CardSlotDetailWindow(QDialog):
         self._populate_pattern_grid()
         self._delete_btn.setEnabled(self.slot.pattern_type != "Empty")
         self._update_nav_buttons()
+
+    def _display_xy(self):
+        """Pattern coordinates in the hoop frame, for the preview.
+
+        Embroidery patterns are stored in protocol units measured from the far
+        edge of the design, so they are mirrored into the hoop and shifted by the
+        centring margin.  Every other pattern type is drawn as stored.
+        """
+        coordinates = list(self.slot.pattern_xy)
+        if self.slot.pattern_type != "Embroidery":
+            return coordinates
+
+        stats = self.slot.get_pattern_stats()
+        if stats.get("span_x") is None or stats.get("min_x") is None:
+            return coordinates
+
+        x_offset = stats["min_x"] + stats["span_x"]
+        y_offset = stats["min_y"] + stats["span_y"]
+        display = []
+        for i in range(0, len(coordinates) - 1, 2):
+            display.extend([x_offset - coordinates[i], y_offset - coordinates[i + 1]])
+        return display
+
+    def _display_canvas(self):
+        """Canvas extent (width, height) matching _display_xy(), or None."""
+        if self.slot.pattern_type != "Embroidery":
+            return None
+        stats = self.slot.get_pattern_stats()
+        if stats.get("hoop_x") is None:
+            return None
+        return (stats["hoop_x"], stats["hoop_y"])
 
     def _colour_palette(self):
         """Return one QColor per thread-colour section, in section order.
