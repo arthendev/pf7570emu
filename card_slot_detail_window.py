@@ -259,6 +259,12 @@ class CardSlotDetailWindow(QDialog):
         self.setMinimumHeight(500)
         self.resize(720, 860)
         self._setup_ui()
+        if self.slot.pattern_type == "Embroidery":
+            # Embroidery designs read best with the hoop shown and the stitch
+            # points hidden, and the raw fields are clearer with logical split.
+            self._logical_split_cb.setChecked(True)
+            self._show_canvas_cb.setChecked(True)
+            self._hide_points_cb.setChecked(True)
         self._load_slot()
 
     # ------------------------------------------------------------------
