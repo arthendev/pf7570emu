@@ -1187,10 +1187,9 @@ class CommProtocol:
             return b""
 
         if sub == self._CARD_CHUNK_WAIT_SIZE:
-            if byte == self.CTRL_EOT:
-                logger.info("Write Card: CTRL_EOT during chunk size byte - aborting")
-                self._abort_write_card()
-                return b""
+            # The byte following CTRL_ENQ is always the payload size — whatever its
+            # value. Control-character values are legal sizes: a final, short chunk
+            # of 4 bytes sends size 0x04 (== CTRL_EOT) and must NOT abort the transfer.
             self._write_card_chunk_size = byte
             self._write_card_data_substate = (
                 self._CARD_CHUNK_SIZE_REPEAT if byte == 0 else self._CARD_CHUNK_PAYLOAD
