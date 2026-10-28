@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QTextEdit, QGroupBox, QTabWidget, QWidget,
                              QScrollArea, QGridLayout, QSizePolicy, QSpacerItem,
                              QTableWidget, QTableWidgetItem, QMenu, QApplication,
-                             QCheckBox, QFrame)
+                             QCheckBox, QFrame, QLineEdit)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import QShortcut
 from PyQt5.QtGui import QKeySequence
@@ -479,7 +479,15 @@ class CardSlotDetailWindow(QDialog):
         pattern_tab.setLayout(pattern_layout)
         tabs.addTab(pattern_tab, "Pattern")
 
-        # Tab 4: Stats (statistics table)
+        # Tab 4: Extras (Embroidery only) — payload metadata that has no place
+        # among the stitch tables: the design name carried by the 0x27 title
+        # command and the software's colour table (0x28 41 01).  The tab is
+        # added right after "Pattern" and only for Embroidery slots.
+        self._extras_tab = self._build_extras_tab()
+        if self.slot.pattern_type == "Embroidery":
+            tabs.addTab(self._extras_tab, "Extras")
+
+        # Tab 5: Stats (statistics table)
         stats_tab = QWidget()
         stats_layout = QVBoxLayout()
         stats_layout.setAlignment(Qt.AlignTop)
@@ -500,6 +508,7 @@ class CardSlotDetailWindow(QDialog):
 
         tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(tabs, 1)
+        self._tabs = tabs
 
         # Buttons
         btn_layout = QHBoxLayout()
@@ -513,6 +522,133 @@ class CardSlotDetailWindow(QDialog):
         layout.addLayout(btn_layout)
 
         self.setLayout(layout)
+
+    def _build_extras_tab(self) -> QWidget:
+        """Build the Embroidery-only "Extras" tab.
+
+        Two sections: "Name" — the design name carried by the payload's 0x27
+        title command — and "Color palette" — the software's colour table from
+        the 0x28 41 01 command, listed as (R, G, B, x) with a colour swatch per
+        entry.  A section shows "Empty" when the payload carries no such data.
+        """
+        tab = QWidget()
+        layout = QVBoxLayout()
+        layout.setAlignment(Qt.AlignTop)
+        mono = QFont("Courier New", 9)
+
+        # ---- Name ------------------------------------------------
+        # The 0x27 title field: a length byte followed by that many text bytes,
+        # usually NUL-terminated.  Shown like the raw header — read-only hex and
+        # ASCII line edits side by side.
+        name_group = QGroupBox("Name")
+        name_layout = QVBoxLayout()
+
+        hex_row = QHBoxLayout()
+        hex_label = QLabel("Hex")
+        hex_label.setMinimumWidth(38)
+        self._extras_name_hex_edit = QLineEdit()
+        self._extras_name_hex_edit.setReadOnly(True)
+        self._extras_name_hex_edit.setFont(mono)
+        hex_row.addWidget(hex_label)
+        hex_row.addWidget(self._extras_name_hex_edit, 1)
+        name_layout.addLayout(hex_row)
+
+        ascii_row = QHBoxLayout()
+        ascii_label = QLabel("ASCII")
+        ascii_label.setMinimumWidth(38)
+        self._extras_name_ascii_edit = QLineEdit()
+        self._extras_name_ascii_edit.setReadOnly(True)
+        self._extras_name_ascii_edit.setFont(mono)
+        ascii_row.addWidget(ascii_label)
+        ascii_row.addWidget(self._extras_name_ascii_edit, 1)
+        name_layout.addLayout(ascii_row)
+
+        name_group.setLayout(name_layout)
+        layout.addWidget(name_group)
+
+        # ---- Color palette ---------------------------------------
+        palette_group = QGroupBox("Color palette")
+        palette_layout = QVBoxLayout()
+
+        self._extras_palette_table = QTableWidget()
+        self._extras_palette_table.setColumnCount(6)
+        self._extras_palette_table.setHorizontalHeaderLabels(
+            ["#", "Swatch", "R", "G", "B", "x"])
+        self._extras_palette_table.verticalHeader().setVisible(False)
+        self._extras_palette_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._extras_palette_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._extras_palette_table.setSelectionMode(QTableWidget.SingleSelection)
+        self._extras_palette_table.setColumnWidth(1, 60)
+        palette_layout.addWidget(self._extras_palette_table, 1)
+
+        self._extras_palette_empty_label = QLabel("Empty")
+        self._extras_palette_empty_label.setFont(mono)
+        palette_layout.addWidget(self._extras_palette_empty_label, 1)
+
+        palette_group.setLayout(palette_layout)
+        layout.addWidget(palette_group, 1)
+
+        tab.setLayout(layout)
+        return tab
+
+    def _ensure_extras_tab(self):
+        """Show the Extras tab only while an Embroidery slot is displayed."""
+        needed = self.slot.pattern_type == "Embroidery"
+        index = self._tabs.indexOf(self._extras_tab)
+        if needed and index < 0:
+            self._tabs.insertTab(3, self._extras_tab, "Extras")
+        elif not needed and index >= 0:
+            self._tabs.removeTab(index)
+
+    @staticmethod
+    def _title_text(raw: bytes) -> str:
+        """Decode the text of a 0x27 title field.
+
+        The field's first byte is the length of the text that follows; a
+        trailing 0x00 marks a NUL-terminated name and is not part of the text.
+        """
+        if len(raw) < 2:
+            return ""
+        length = raw[0]
+        text = raw[1:1 + length] if 1 + length <= len(raw) else raw[1:]
+        if text.endswith(b"\x00"):
+            text = text[:-1]
+        return text.split(b"\x00", 1)[0].decode("latin-1", errors="replace")
+
+    def _populate_extras(self):
+        """Fill the Extras tab from the current slot's decoded payload."""
+        raw = bytes(getattr(self.slot, "payload_title_raw", b"") or b"")
+        name = (getattr(self.slot, "payload_filename", "") or "").strip()
+        if not raw and not name:
+            self._extras_name_hex_edit.setText("Empty")
+            self._extras_name_ascii_edit.setText("Empty")
+        else:
+            # Hex shows the field verbatim, length byte included.
+            self._extras_name_hex_edit.setText(
+                " ".join(f"{byte:02X}" for byte in raw) if raw else "Empty")
+            text = self._title_text(raw) if raw else name
+            self._extras_name_ascii_edit.setText(text if text else "Empty")
+
+        table = list(getattr(self.slot, "payload_colour_table", None) or [])
+        self._extras_palette_table.setVisible(bool(table))
+        self._extras_palette_empty_label.setVisible(not table)
+
+        self._extras_palette_table.setRowCount(len(table))
+        for row, entry in enumerate(table):
+            values = list(entry) + [0] * (4 - len(entry))
+            r, g, b, x = (int(v) for v in values[:4])
+            num_item = QTableWidgetItem(str(row + 1))
+            num_item.setTextAlignment(Qt.AlignCenter)
+            swatch = QTableWidgetItem("")
+            swatch.setBackground(QColor(r, g, b))
+            swatch.setToolTip(QColor(r, g, b).name())
+            cells = [num_item, swatch]
+            for value in (r, g, b, x):
+                item = QTableWidgetItem(str(value))
+                item.setTextAlignment(Qt.AlignCenter)
+                cells.append(item)
+            for col, item in enumerate(cells):
+                self._extras_palette_table.setItem(row, col, item)
 
     # ------------------------------------------------------------------
     # Data helpers
@@ -1123,6 +1259,8 @@ class CardSlotDetailWindow(QDialog):
         self._populate_header_grid()
         self._populate_stats_grid()
         self._populate_pattern_grid()
+        self._ensure_extras_tab()
+        self._populate_extras()
         self._delete_btn.setEnabled(self.slot.pattern_type != "Empty")
         self._update_nav_buttons()
 
@@ -1144,8 +1282,9 @@ class CardSlotDetailWindow(QDialog):
         """
         numbers = list(getattr(self.slot, "payload_section_colours", None) or [])
         table = list(getattr(self.slot, "payload_colour_table", None) or [])
-        base = ([QColor(r, g, b) for r, g, b in table] if len(table) == 16
-                else list(CARD_COLOR_PALETTE))
+        # Table entries are (R, G, B, x); the 4th byte is unused by the machine.
+        base = ([QColor(entry[0], entry[1], entry[2]) for entry in table]
+                if len(table) == 16 else list(CARD_COLOR_PALETTE))
         if not numbers:
             return []
         return [base[(number - 1) % len(base)] for number in numbers]

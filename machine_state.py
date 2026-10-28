@@ -526,7 +526,8 @@ def decode_embroidery_payload(raw_hex: str,
                               sections_out: Optional[List[tuple]] = None,
                               colour_table_out: Optional[List[tuple]] = None,
                               values_out: Optional[List[tuple]] = None,
-                              origin_out: Optional[List[tuple]] = None):
+                              origin_out: Optional[List[tuple]] = None,
+                              title_raw_out: Optional[List[bytes]] = None):
     """Decode an Embroidery card payload into protocol-unit points.
 
     Returns ``(pattern_xy, data, consumed)`` — an interleaved x/y list in
@@ -542,9 +543,13 @@ def decode_embroidery_payload(raw_hex: str,
 
     ``colour_points``     point indices at which a new thread colour starts
     ``filename_out``      the title command's name ('' when the design is unnamed)
+    ``title_raw_out``     the title field exactly as the payload stores it, i.e.
+                          the length byte followed by that many text bytes
+                          (``b""`` when the design is unnamed)
     ``sections_out``      ``(first point index, colour number)`` per colour
                           section, starting with the initial colour
-    ``colour_table_out``  the software's colour table, 16 x ``(r, g, b)``
+    ``colour_table_out``  the software's colour table, 16 x ``(r, g, b, x)``
+                          (the 4th byte is stored by PCD but unused)
     ``origin_out``        ``(x, y)`` from the ``28 05 00`` command, i.e. the
                           design's top-right corner in protocol units; the
                           position values are distances from it towards the
@@ -568,6 +573,7 @@ def decode_embroidery_payload(raw_hex: str,
     values: List[tuple] = []
     sections: List[tuple] = []
     title = ""
+    title_raw = b""
     colour_table: List[tuple] = []
     origin: Optional[tuple] = None
 
@@ -611,6 +617,8 @@ def decode_embroidery_payload(raw_hex: str,
                 group_colour = marker - 0x2F
             elif marker == EMBROIDERY_CMD_TITLE:
                 title = payload.split(b"\x00", 1)[0].decode("latin-1", errors="replace")
+                # Keep the field verbatim: 0x27 <length> <length text bytes>.
+                title_raw = bytes([len(payload)]) + payload
             elif marker == EMBROIDERY_CMD_EXTRA:
                 # 28 05 00 carries the design origin, the corner every position
                 # is measured from: y first, then x, both little-endian.
@@ -620,7 +628,9 @@ def decode_embroidery_payload(raw_hex: str,
                               int.from_bytes(payload[1:3], "little"))
                 elif len(payload) >= 65 and payload[0] == EMBROIDERY_EXTRA_COLOUR_TABLE:
                     table = payload[1:65]
-                    colour_table = [tuple(table[i * 4:i * 4 + 3]) for i in range(16)]
+                    # Each entry is (R, G, B, x): PCD stores a 4th byte that the
+                    # machine ignores, kept so the UI can show it verbatim.
+                    colour_table = [tuple(table[i * 4:i * 4 + 4]) for i in range(16)]
             elif marker == EMBROIDERY_CMD_END:
                 end_of_design = True
 
@@ -661,6 +671,8 @@ def decode_embroidery_payload(raw_hex: str,
         sections_out.extend(sections)
     if filename_out is not None:
         filename_out.append(title)
+    if title_raw_out is not None:
+        title_raw_out.append(title_raw)
     if colour_table_out is not None:
         colour_table_out.extend(colour_table)
     if values_out is not None:
@@ -694,11 +706,15 @@ class CardMemorySlot:
     # Design name from the payload's file-name group (Embroidery only).
     # Derived from pattern_raw by parse_pattern_data(), so not persisted.
     payload_filename: str = ""
+    # The 0x27 title field exactly as the payload stores it: a length byte
+    # followed by that many text bytes (usually NUL-terminated).  Empty when the
+    # payload carries no title.  Derived, so not persisted.
+    payload_title_raw: bytes = b""
     # Colour number (1..16) of each colour section, starting with the initial
     # colour.  len(payload_section_colours) == len(color_change_points) + 1.
     payload_section_colours: List[int] = field(default_factory=list)
-    # The software's colour table from the 0x28 41 01 command: 16 x (r, g, b),
-    # or empty when the design carries no thread colours.
+    # The software's colour table from the 0x28 41 01 command: 16 x
+    # (r, g, b, x), or empty when the design carries no thread colours.
     payload_colour_table: List[tuple] = field(default_factory=list)
     # Design origin from the 0x28 05 00 command: (x, y) in protocol units, i.e.
     # the top-right corner the position values are measured from.  Empty when the
@@ -724,6 +740,7 @@ class CardMemorySlot:
         self.pattern_xytacc = []
         self.color_change_points = []
         self.payload_filename = ""
+        self.payload_title_raw = b""
         self.payload_section_colours = []
         self.payload_colour_table = []
         self.payload_origin = ()
@@ -761,6 +778,7 @@ class CardMemorySlot:
         pattern_xytacc: List[int] = []
         color_change_points: List[int] = []
         payload_filename = ""
+        payload_title_raw: List[bytes] = []
         section_colours: List[int] = []
         colour_table: List[tuple] = []
         origin: List[tuple] = []
@@ -892,7 +910,8 @@ class CardMemorySlot:
             sections: List[tuple] = []
             pattern_xy, body, consumed = decode_embroidery_payload(
                 self.pattern_raw, color_change_points, names, sections,
-                colour_table, origin_out=origin)
+                colour_table, origin_out=origin,
+                title_raw_out=payload_title_raw)
             payload_filename = names[0] if names else ""
             section_colours = [number for _start, number in sections]
             pattern_bytes = list(body[:consumed]) if consumed else list(body)
@@ -908,6 +927,7 @@ class CardMemorySlot:
         self.pattern_xytacc = pattern_xytacc
         self.color_change_points = color_change_points
         self.payload_filename = payload_filename
+        self.payload_title_raw = payload_title_raw[0] if payload_title_raw else b""
         self.payload_section_colours = section_colours
         self.payload_colour_table = colour_table
         self.payload_origin = origin[0] if origin else ()
