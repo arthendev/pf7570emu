@@ -481,6 +481,86 @@ def _parse_command_group(data: bytes, index: int):
     return None                     # the group never closed
 
 
+def _tokenize_embroidery(data: bytes) -> List[tuple]:
+    """Split a payload into stitch steps and command groups.
+
+    Each entry is ``(kind, payload, start, end)``: *kind* is ``"step"`` with
+    ``payload = (dy, dx)``, or ``"group"`` with *payload* the command list from
+    :func:`_parse_command_group`.  The byte offsets let the walk report how much
+    of the payload it consumed.  An unknown or truncated group ends the walk, so
+    a damaged payload still yields the stitches read up to that point.
+    """
+    tokens: List[tuple] = []
+    index = 0
+    while index < len(data):
+        if data[index] != EMBROIDERY_GROUP_MARK:
+            # Plain relative step: two signed bytes (dy, dx), one stitch.  Only
+            # checked at step boundaries, so an 0x80 inside a delta byte is not
+            # mistaken for a group.
+            if index + 2 > len(data):
+                break
+            tokens.append(("step",
+                           (_signed_byte(data[index]), _signed_byte(data[index + 1])),
+                           index, index + 2))
+            index += 2
+            continue
+        parsed = _parse_command_group(data, index)
+        if parsed is None:
+            break
+        commands, next_index = parsed
+        tokens.append(("group", commands, index, next_index))
+        index = next_index
+    return tokens
+
+
+def _group_colour_number(commands) -> Optional[int]:
+    """Return the thread colour a command group selects, or ``None``."""
+    for marker, _payload in commands:
+        if EMBROIDERY_CMD_COLOUR_MIN <= marker <= EMBROIDERY_CMD_COLOUR_MAX:
+            return marker - 0x2F
+    return None
+
+
+def _absolute_position(commands) -> Optional[tuple]:
+    """Return the last absolute position a command group names, or ``None``."""
+    point = None
+    for marker, payload in commands:
+        if marker == EMBROIDERY_CMD_ABS_POS:
+            point = (_signed_be16(payload, 2), _signed_be16(payload, 0))
+    return point
+
+
+def _colour_block_at(tokens: List[tuple], index: int):
+    """Describe the colour-change block that starts at ``tokens[index]``.
+
+    The long form is a group that only moves to the stitch ending the old
+    colour, an optional zero-length tie-off, and then a colour group naming the
+    same position.  The position is therefore sent twice but names one stitch.
+
+    Returns ``(point, colour, next_index)``, or ``None`` when the tokens do not
+    have that shape — then the groups are ordinary stitches and a colour group
+    keeps its own point (the short form ``80 2E P 3n 80``).
+    """
+    kind, commands, _start, _end = tokens[index]
+    if kind != "group" or _group_colour_number(commands) is not None:
+        return None
+    point = _absolute_position(commands)
+    if point is None:
+        return None
+
+    position = index + 1
+    while (position < len(tokens) and tokens[position][0] == "step"
+           and tokens[position][1] == (0, 0)):
+        position += 1
+    if position >= len(tokens) or tokens[position][0] != "group":
+        return None
+    colour_commands = tokens[position][1]
+    colour = _group_colour_number(colour_commands)
+    if colour is None or _absolute_position(colour_commands) != point:
+        return None
+    return point, colour, position + 1
+
+
 def split_embroidery_payload(data: bytes) -> List[tuple]:
     """Split an Embroidery payload into the logical blocks the decoder walks.
 
@@ -538,6 +618,16 @@ def decode_embroidery_payload(raw_hex: str,
     len(data)`` means an unknown command stopped the walk, so the returned
     geometry is only the leading part of the design.
 
+    A colour change is a block of its own: a jump marker, an absolute resync to
+    the last stitch of the colour that ends, a tie-off, and then the colour
+    command, which names the same position once more.  The position is therefore
+    sent twice but names one stitch, and that stitch is never also sent as a
+    relative step — the block replaces its ordinary record.  The walk records
+    exactly one stitch for it, with the colour that ends there; any further
+    record at the same position is a stitch the design really has.  Cards that
+    use the short form ``80 2E P 3n 80`` put the first stitch of the new colour
+    in the block, and that point is kept the same way.
+
     Optional out-parameters (appended to, so they stay untouched when the payload
     carries nothing of that kind):
 
@@ -583,25 +673,37 @@ def decode_embroidery_payload(raw_hex: str,
         if not sections or sections[-1][1] != point_colour:
             sections.append((len(values) - 1, point_colour))
 
+    tokens = _tokenize_embroidery(data)
+    consumed = 0
     index = 0
-    while index < len(data):
-        if data[index] != EMBROIDERY_GROUP_MARK:
-            # Plain relative step: two signed bytes (dy, dx), one stitch.
-            if index + 2 > len(data):
-                break
-            y += _signed_byte(data[index])
-            x += _signed_byte(data[index + 1])
+    while index < len(tokens):
+        kind, token_payload, _start, end = tokens[index]
+
+        if kind == "step":
+            dy, dx = token_payload
+            y += dy
+            x += dx
             add_point(x, y, colour)
-            index += 2
+            consumed = end
+            index += 1
             continue
 
-        parsed = _parse_command_group(data, index)
-        if parsed is None:
-            # Unknown or truncated group: stop rather than invent stitches.
-            break
-        commands, index = parsed
+        commands = token_payload
+        block = _colour_block_at(tokens, index)
+        if block is not None:
+            # Long form: the block names the stitch that ends the old colour
+            # twice - a resync and the colour command - with the tie-off between
+            # them.  It replaces that stitch's ordinary record, so exactly one
+            # stitch comes out of it, with the colour that ends here; any
+            # further record at the same position is a stitch the design has.
+            point, new_colour, next_index = block
+            add_point(point[0], point[1], colour)
+            x, y = point
+            colour = new_colour
+            consumed = tokens[next_index - 1][3]
+            index = next_index
+            continue
 
-        group_colour = None
         group_points: List[tuple] = []
         end_of_design = False
         for marker, payload in commands:
@@ -613,8 +715,6 @@ def decode_embroidery_payload(raw_hex: str,
                 y += _signed_byte(payload[0])
                 x += _signed_byte(payload[1])
                 group_points.append((x, y))
-            elif EMBROIDERY_CMD_COLOUR_MIN <= marker <= EMBROIDERY_CMD_COLOUR_MAX:
-                group_colour = marker - 0x2F
             elif marker == EMBROIDERY_CMD_TITLE:
                 title = payload.split(b"\x00", 1)[0].decode("latin-1", errors="replace")
                 # Keep the field verbatim: 0x27 <length> <length text bytes>.
@@ -634,15 +734,15 @@ def decode_embroidery_payload(raw_hex: str,
             elif marker == EMBROIDERY_CMD_END:
                 end_of_design = True
 
-        # A colour command also covers the stitches of its own group: in the
-        # short form "80 2E P 3n 80" P is already the first point of the new
-        # colour, while in the long form the change has a group of its own and
-        # the preceding groups keep the old colour.
-        if group_colour is None:
-            group_colour = colour
-        colour = group_colour
-        for x, y in group_points:
-            add_point(x, y, group_colour)
+        # A colour command also covers the stitches of its own group: the short
+        # form "80 2E P 3n 80" carries the first stitch of the new colour.
+        group_colour = _group_colour_number(commands)
+        if group_colour is not None:
+            colour = group_colour
+        for point_x, point_y in group_points:
+            add_point(point_x, point_y, colour)
+        consumed = end
+        index += 1
         if end_of_design:
             break
 
@@ -679,7 +779,7 @@ def decode_embroidery_payload(raw_hex: str,
         values_out.extend(values)
     if origin_out is not None and origin is not None:
         origin_out.append(origin)
-    return pattern_xy, data, index
+    return pattern_xy, data, consumed
 
 
 @dataclass
