@@ -59,7 +59,24 @@ class CardPatternPreview(PatternPreview):
     purpose: 9mm and MAXI patterns never carry colour changes.  Card slots do
     (Embroidery), so the colour handling lives here instead of leaking into the
     shared widget.
+
+    Ctrl+scroll zooms the drawing, right-drag pans it and double-click resets
+    the view; the zoom factor is applied on top of the usual fit-to-widget
+    scale, so 1.0 means "whole design visible".  A left click on a stitch point
+    selects it and emits ``point_clicked(index)``.
     """
+
+    # Emitted with the point index when a stitch point is left-clicked.
+    point_clicked = pyqtSignal(int)
+
+    # Limits and per-notch factor of the Ctrl+scroll zoom.
+    ZOOM_MIN = 0.25
+    ZOOM_MAX = 30.0
+    ZOOM_STEP = 1.25
+    # Click tolerance (pixels) when picking the stitch under the cursor.
+    PICK_RADIUS = 6
+    # Blank border (pixels) kept around the fitted drawing.
+    PADDING = 4
 
     def __init__(self, pattern_xy, pattern_type="", show_points=False,
                  canvas_size=None, plot_xy=None):
@@ -69,6 +86,186 @@ class CardPatternPreview(PatternPreview):
         # QColor to draw each section with (cycled past the palette size).
         self.color_change_points = []
         self.color_palette = []
+        # Zoom factor on top of the fit-to-widget scale (Ctrl+scroll) and pan
+        # offset in pixels (right-drag).
+        self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self._panning = False
+        self._pan_last = None
+        # The right button pans instead of opening a context menu.
+        self.setContextMenuPolicy(Qt.NoContextMenu)
+        self.setToolTip("Ctrl+scroll: zoom\nRight-drag: pan\n"
+                        "Left-click: select stitch\nDouble-click: reset view")
+
+    def wheelEvent(self, event):
+        """Ctrl+scroll changes the zoom; plain scrolling is left untouched."""
+        if not (event.modifiers() & Qt.ControlModifier):
+            super().wheelEvent(event)
+            return
+        notches = event.angleDelta().y() / 120.0
+        if not notches:
+            super().wheelEvent(event)
+            return
+        # Zoom about the cursor, so the stitch under it stays put.
+        self._set_zoom(self.zoom * (self.ZOOM_STEP ** notches), anchor=event.pos())
+        event.accept()
+
+    def mousePressEvent(self, event):
+        """Left click selects the stitch under the cursor; right press starts a pan."""
+        if event.button() == Qt.RightButton:
+            self._panning = True
+            self._pan_last = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        if event.button() == Qt.LeftButton:
+            idx = self._point_at(event.pos())
+            if idx is not None:
+                self.selected_point = idx
+                self.update()
+                self.point_clicked.emit(idx)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """Shift the drawing while the right button is held."""
+        if self._panning:
+            delta = event.pos() - self._pan_last
+            self._pan_last = event.pos()
+            self.pan_x += delta.x()
+            self.pan_y += delta.y()
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """End a right-button pan."""
+        if event.button() == Qt.RightButton and self._panning:
+            self._panning = False
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        """Double-click restores the fit-to-widget view (zoom and pan)."""
+        if event.button() == Qt.LeftButton and (self.zoom != 1.0
+                                                or self.pan_x or self.pan_y):
+            self.zoom = 1.0
+            self.pan_x = 0.0
+            self.pan_y = 0.0
+            self.update()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def _set_zoom(self, zoom, anchor=None):
+        """Clamp and apply a new zoom factor, keeping *anchor* fixed on screen.
+
+        *anchor* is a widget position (the mouse cursor); the pan offsets are
+        adjusted so the point that was under it stays under it.  Without an
+        anchor the drawing simply grows about the widget centre.
+        """
+        zoom = max(self.ZOOM_MIN, min(self.ZOOM_MAX, zoom))
+        if abs(zoom - self.zoom) < 1e-6:
+            return
+        extent = self._view_extent()
+        if anchor is not None and extent is not None:
+            x_min, y_min, x_max, y_max = extent
+            x_range = x_max - x_min or 1
+            y_range = y_max - y_min or 1
+            height = self.height()
+            # Pattern units under the cursor before the zoom change…
+            old_x, old_y, old_scale = self._base_offsets(self.zoom, x_range, y_range)
+            unit_x = (anchor.x() - self.pan_x - old_x) / old_scale
+            unit_y = (height - old_y + self.pan_y - anchor.y()) / old_scale
+            # …and the pan that puts those same units back under it.
+            new_x, new_y, new_scale = self._base_offsets(zoom, x_range, y_range)
+            self.pan_x = anchor.x() - new_x - unit_x * new_scale
+            self.pan_y = anchor.y() - height + new_y + unit_y * new_scale
+        self.zoom = zoom
+        self.update()
+
+    def _view_extent(self):
+        """``(x_min, y_min, x_max, y_max)`` of the plotted area, or None.
+
+        The canvas when it is shown, else the design's own extent.  Returns None
+        when there is nothing to plot.
+        """
+        if not self.pattern_xy or len(self.pattern_xy) < 2:
+            return None
+        xs = self.pattern_xy[0::2]
+        ys = self.pattern_xy[1::2]
+        if min(len(xs), len(ys)) < 1:
+            return None
+        canvas = self._canvas_bounds()
+        if self.show_canvas and canvas is not None:
+            return (0, 0, canvas[0], canvas[1])
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    def _base_offsets(self, zoom, x_range, y_range):
+        """Centring offsets and total scale for *zoom* (no pan applied)."""
+        draw_w = self.width() - 2 * self.PADDING
+        draw_h = self.height() - 2 * self.PADDING
+        scale = min(draw_w / x_range, draw_h / y_range) * zoom
+        return (self.PADDING + (draw_w - x_range * scale) / 2,
+                self.PADDING + (draw_h - y_range * scale) / 2,
+                scale)
+
+    def _plot_geometry(self):
+        """Geometry of the current view: ``(xs, ys, n, to_screen, bounds)``.
+
+        ``to_screen`` maps a pattern point to widget pixels, including the
+        fit-to-widget scale, the Ctrl+scroll ``zoom`` and the ``pan_x`` /
+        ``pan_y`` offsets; ``bounds`` is ``(x_min, y_min, x_max, y_max)`` — the
+        canvas when it is shown, else the design's own extent.  Painting and
+        hit-testing share the helper, so a click lands on the stitch that is
+        actually drawn under the cursor.  Returns None when nothing is drawable.
+        """
+        extent = self._view_extent()
+        if extent is None:
+            return None
+        xs = self.pattern_xy[0::2]
+        ys = self.pattern_xy[1::2]
+        n = min(len(xs), len(ys))
+        if n < 1:
+            return None
+
+        height = self.height()
+        x_min, y_min, x_max, y_max = extent
+        x_range = x_max - x_min or 1
+        y_range = y_max - y_min or 1
+        # Fit the design to the widget, then apply zoom; the offsets keep the
+        # drawing centred (Qt clips whatever no longer fits) and pan shifts it
+        # by whole pixels.
+        x_offset, y_offset, scale = self._base_offsets(self.zoom, x_range, y_range)
+        x_offset += self.pan_x
+
+        def to_screen(xi, yi):
+            sx = x_offset + (xi - x_min) * scale
+            sy = height - y_offset - (yi - y_min) * scale + self.pan_y
+            return int(sx), int(sy)
+
+        return xs, ys, n, to_screen, extent
+
+    def _point_at(self, pos):
+        """Index of the stitch point drawn under *pos*, or None."""
+        geometry = self._plot_geometry()
+        if geometry is None:
+            return None
+        xs, ys, n, to_screen, _bounds = geometry
+        best = None
+        best_dist = self.PICK_RADIUS * self.PICK_RADIUS
+        for i in range(n):
+            sx, sy = to_screen(xs[i], ys[i])
+            dist = (sx - pos.x()) ** 2 + (sy - pos.y()) ** 2
+            if dist <= best_dist:
+                best_dist = dist
+                best = i
+        return best
 
     def _section_indices(self, n):
         """Return the thread-colour section number of each point, or None.
@@ -120,42 +317,20 @@ class CardPatternPreview(PatternPreview):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        width = self.width()
-        height = self.height()
-        padding = 4
-
-        xs = self.pattern_xy[0::2]
-        ys = self.pattern_xy[1::2]
-        n = min(len(xs), len(ys))
+        geometry = self._plot_geometry()
+        if geometry is None:
+            painter.end()
+            return
+        xs, ys, n, to_screen, bounds = geometry
         if n < 2:
             painter.end()
             return
 
-        canvas = self._canvas_bounds()
-        if self.show_canvas and canvas is not None:
-            x_min, x_max = 0, canvas[0]
-            y_min, y_max = 0, canvas[1]
-        else:
-            x_min, x_max = min(xs), max(xs)
-            y_min, y_max = min(ys), max(ys)
-        x_range = x_max - x_min or 1
-        y_range = y_max - y_min or 1
-
-        draw_w = width - 2 * padding
-        draw_h = height - 2 * padding
-        scale = min(draw_w / x_range, draw_h / y_range)
-        x_offset = padding + (draw_w - x_range * scale) / 2
-        y_offset = padding + (draw_h - y_range * scale) / 2
-
-        def to_screen(xi, yi):
-            sx = x_offset + (xi - x_min) * scale
-            sy = height - y_offset - (yi - y_min) * scale
-            return int(sx), int(sy)
-
         # Canvas boundary rectangle
         if self.show_canvas:
-            cx1, cy1 = to_screen(x_min, y_min)
-            cx2, cy2 = to_screen(x_max, y_max)
+            bcx1, bcy1, bcx2, bcy2 = bounds
+            cx1, cy1 = to_screen(bcx1, bcy1)
+            cx2, cy2 = to_screen(bcx2, bcy2)
             painter.setPen(QPen(QColor(180, 180, 180), 1, Qt.DashLine))
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(
@@ -317,6 +492,7 @@ class CardSlotDetailWindow(QDialog):
 
         self._preview = CardPatternPreview([], "", show_points=True, plot_xy=True)
         self._preview.setFixedHeight(160)
+        self._preview.point_clicked.connect(self._on_preview_point_clicked)
         preview_layout.addWidget(self._preview, 1)
 
         bitmap_column = QVBoxLayout()
@@ -478,6 +654,7 @@ class CardSlotDetailWindow(QDialog):
 
         pattern_tab.setLayout(pattern_layout)
         tabs.addTab(pattern_tab, "Pattern")
+        self._pattern_tab = pattern_tab
 
         # Tab 4: Extras (Embroidery only) — payload metadata that has no place
         # among the stitch tables: the design name carried by the 0x27 title
@@ -1218,6 +1395,22 @@ class CardSlotDetailWindow(QDialog):
         except Exception:
             self._preview.selected_point = row
         self._preview.update()
+
+    def _on_preview_point_clicked(self, idx: int):
+        """Select the stitch clicked in the preview on the Pattern tab.
+
+        ``_populate_pattern_grid`` writes one row per point in payload order, so
+        row *idx* is the clicked stitch; selecting it also drives the preview
+        marker through ``_on_point_table_selection_changed``.
+        """
+        table = self._points_table
+        if not (0 <= idx < table.rowCount()):
+            return
+        table.selectRow(idx)
+        item = table.item(idx, 0)
+        if item is not None:
+            table.scrollToItem(item, QTableWidget.PositionAtCenter)
+        self._tabs.setCurrentWidget(self._pattern_tab)
 
     # ------------------------------------------------------------------
     # Data helpers (load/refresh)
