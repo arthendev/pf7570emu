@@ -462,3 +462,20 @@ class CardMemoryTab(QWidget):
         self._eject_card_btn.setEnabled(enabled and self.machine_state.card_inserted)
         self._save_card_btn.setEnabled(enabled and self.machine_state.card_inserted)
         self._auto_save_checkbox.setEnabled(enabled)
+
+    def set_space_support(self, p_muster: bool, embroidery: bool):
+        """Enable the card spaces the current machine model can handle.
+
+        ``p_muster`` covers the 9mm and MAXI spaces, ``embroidery`` the
+        Embroidery space (see MachineModel.card_p_muster / card_embroidery).
+        """
+        support = (bool(p_muster), bool(p_muster), bool(embroidery))
+        for index, supported in enumerate(support):
+            self._tab_widget.setTabEnabled(index, supported)
+
+        current = self._tab_widget.currentIndex()
+        if current >= 0 and not self._tab_widget.isTabEnabled(current):
+            for index, supported in enumerate(support):
+                if supported:
+                    self._tab_widget.setCurrentIndex(index)
+                    break

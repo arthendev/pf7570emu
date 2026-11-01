@@ -15,6 +15,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 
 from machine_state import MachineState, CardMemorySlot, MMemorySlot
+from machine_models import DEFAULT_MODEL_NAME, MACHINE_MODELS
 from pmemory_tab import PMemoryTab
 from mmemory_tab import MMemoryTab
 from card_memory_tab import CardMemoryTab
@@ -73,7 +74,7 @@ class Creative75xxEmulator(QMainWindow):
         self.card_memory_tab.card_created.connect(self._on_card_created)
         self.card_memory_tab.card_state_changed.connect(self._update_card_menu_state)
         self.create_menu()
-        self._update_card_model_support()
+        self._update_model_support()
 
         logger.info("Application started")
         self._try_auto_connect()
@@ -233,14 +234,15 @@ class Creative75xxEmulator(QMainWindow):
         model_group = QActionGroup(self)
         model_group.setExclusive(True)
         self._model_actions = {}
-        for model_name in ("PFAFF Creative 7570", "PFAFF Creative 7550", "PFAFF Creative 1475 CD", "PFAFF Creative 1475A"):
+        for model in MACHINE_MODELS:
+            model_name = model.name
             action = QAction(model_name, self)
             action.setCheckable(True)
             action.triggered.connect(lambda checked, m=model_name: self._on_model_selected(m))
             model_group.addAction(action)
             model_submenu.addAction(action)
             self._model_actions[model_name] = action
-        self._model_actions["PFAFF Creative 7570"].setChecked(True)
+        self._model_actions[DEFAULT_MODEL_NAME].setChecked(True)
 
         pmemory_submenu = QMenu("P-Memory", self)
         machine_menu.addMenu(pmemory_submenu)
@@ -329,7 +331,7 @@ class Creative75xxEmulator(QMainWindow):
             "python_console":  {"warning": True, "info": True, "debug": True},
             "log_to_file":     {"enabled": False, "warning": True, "info": True, "debug": True},
             "serial":          {"port": None, "baudrate": 4800},
-            "machine":         {"model": "PFAFF Creative 7570"},
+            "machine":         {"model": DEFAULT_MODEL_NAME},
             "general":         {"auto_connect": False, "open_state_on_start": False},
         }
         base_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
@@ -372,13 +374,13 @@ class Creative75xxEmulator(QMainWindow):
         for level, key in self._LEVEL_KEY.items():
             if not self._config["log_to_file"].get(key, True):
                 self._log_to_file_level_actions[level].setChecked(False)
-        saved_model = self._config.get("machine", {}).get("model", "PFAFF Creative 7570")
+        saved_model = self._config.get("machine", {}).get("model", DEFAULT_MODEL_NAME)
         if saved_model in self._model_actions:
             self._model_actions[saved_model].setChecked(True)
             self.machine_state.configure_model(saved_model)
             self.protocol.configure_model(saved_model)
             self.pmemory_tab.update_ui(self.machine_state)
-        self._update_card_model_support()
+        self._update_model_support()
 
     # ------------------------------------------------------------------
     # Recent-files helpers
@@ -391,7 +393,7 @@ class Creative75xxEmulator(QMainWindow):
             self._model_actions[model].setChecked(True)
             self.protocol.configure_model(model)
             self._config.setdefault("machine", {})["model"] = model
-        self._update_card_model_support()
+        self._update_model_support()
 
     RECENT_MAX = 20
 
@@ -743,7 +745,7 @@ class Creative75xxEmulator(QMainWindow):
             self,
             "About Creative 75xx/1475cd Emulator",
             "<h3>Creative 75xx/1475cd Emulator</h3>"
-            "<p>An emulator of communication interference of the PFAFF Creative 7570, 7550 and 1475 CD sewing machines, "
+            "<p>An emulator of communication interference of the PFAFF Creative 7570, 7560, 7550 and 1475 CD sewing machines, "
             "enabling experiments with communication over a serial interface.</p>"
             "<b>Project:</b> "
             '<a href="https://github.com/arthendev/pfaff7570emu">'
@@ -800,7 +802,7 @@ class Creative75xxEmulator(QMainWindow):
         self.machine_state.configure_model(model_name)
         self.protocol.configure_model(model_name)
         self.pmemory_tab.update_ui(self.machine_state)
-        self._update_card_model_support()
+        self._update_model_support()
         self._config.setdefault("machine", {})["model"] = model_name
         self._save_config()
         logger.info(f"Model set to: {model_name}")
@@ -932,22 +934,32 @@ class Creative75xxEmulator(QMainWindow):
         self._set_modified(True)
         logger.info(f"New card created: {file_path}")
 
-    def _update_card_model_support(self):
-        """Enable or disable Memory Card tab and menu items based on machine model.
+    def _update_model_support(self):
+        """Enable or disable tabs, menus and card spaces based on the machine model."""
+        model = self.machine_state.model
+        if model is None:
+            return
 
-        Only PFAFF Creative 7570 supports memory cards.
-        """
-        supported = self.machine_state.supports_card
-        # Tab
-        self.tab_widget.setTabEnabled(2, supported)
+        # Main tabs: P-Memory (0), M-Memory (1), Memory Card (2)
+        tab_support = {0: model.p_memory, 1: model.m_memory, 2: model.memory_cards}
+        for index, supported in tab_support.items():
+            self.tab_widget.setTabEnabled(index, supported)
+        if not tab_support.get(self.tab_widget.currentIndex(), True):
+            for index in sorted(tab_support):
+                if tab_support[index]:
+                    self.tab_widget.setCurrentIndex(index)
+                    break
+
         # Card menu actions
-        self._insert_card_menu_action.setEnabled(supported)
-        self._auto_save_card_menu_action.setEnabled(supported)
-        self._delete_all_card_menu_action.setEnabled(supported)
+        self._insert_card_menu_action.setEnabled(model.memory_cards)
+        self._auto_save_card_menu_action.setEnabled(model.memory_cards)
+        self._delete_all_card_menu_action.setEnabled(model.memory_cards)
         # The card submenu itself
-        self._card_submenu.setEnabled(supported)
+        self._card_submenu.setEnabled(model.memory_cards)
         # Propagate to CardMemoryTab widget
-        self.card_memory_tab.set_card_enabled(supported)
+        self.card_memory_tab.set_card_enabled(model.memory_cards)
+        self.card_memory_tab.set_space_support(
+            p_muster=model.card_p_muster, embroidery=model.card_embroidery)
 
     def _update_card_menu_state(self, inserted: bool):
         """Enable/disable card menu actions based on card insertion state."""

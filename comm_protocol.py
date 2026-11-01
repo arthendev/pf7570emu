@@ -8,6 +8,8 @@ import struct
 import logging
 import time
 
+from machine_models import DEFAULT_MODEL_NAME, get_model
+
 logger = logging.getLogger(__name__)
 
 
@@ -113,14 +115,8 @@ class CommProtocol:
     CARD_MAX_SLOT_MAXI       = 0xFF        # MAXI slots use the full byte range
     CARD_MAX_SLOT_EMBROIDERY = 0xFF - 0xC8 # Embroidery slots are banked from 0xC8, so max slot is 0xFF
 
-    # Bell identification strings per model
-    MODEL_BELL_STRINGS = {
-        "PFAFF Creative 7570":    "Copyright 1992 - 97       G.M. PFAFF AG Creative 7570B    Vers. 2.1", # From real machine
-        "PFAFF Creative 7550":    "Copyright 1992,-93,-94    G.M. PFAFF AG Creative 7550 CD  Vers. 2.0", # From real machine
-        "PFAFF Creative 1475 CD": "Copyright 1990, 1991,     G.M. PFAFF AG      Creative 1475 CD  Vers. 4  ", # From real machine
-        "PFAFF Creative 1475A":   "Copyright 1990, 1991, 1992,    G.M. PFAFF AG Creative 1475A    Vers. 1  ", # From real machine
-}
-    # "PFAFF Creative 7570":    "Copyright 1992 - 96       G.M. PFAFF AG Creative 7570D    Vers. 2.0", # From real machine
+    # Bell identification strings come from machine_models.MACHINE_MODELS
+    # (MachineModel.identification).
 
     # Bell command debounce time (seconds)
     BELL_DEBOUNCE_SECONDS = 0.5
@@ -133,7 +129,8 @@ class CommProtocol:
         self.on_pmemory_changed = on_pmemory_changed  # Optional callback: called when P-Memory is modified
         self.on_card_changed = on_card_changed        # Optional callback: called when card memory is modified
         self.on_mmemory_changed = on_mmemory_changed  # Optional callback: called when M-Memory is modified
-        self._model_name = "PFAFF Creative 7570"
+        self._model = get_model(DEFAULT_MODEL_NAME)
+        self._model_name = self._model.name
         self.cmd_buffer = bytearray()  # Accumulates bytes for text commands
         self.last_bell_time = 0  # Timestamp of last bell command processed
 
@@ -657,10 +654,9 @@ class CommProtocol:
     
     def configure_model(self, model_name: str):
         """Set the active machine model (affects bell response string)."""
-        if model_name not in self.MODEL_BELL_STRINGS:
-            raise ValueError(f"Unknown model: {model_name}")
-        self._model_name = model_name
-        logger.info(f"Protocol model set to: {model_name}")
+        self._model = get_model(model_name)  # raises ValueError for unknown models
+        self._model_name = self._model.name
+        logger.info(f"Protocol model set to: {self._model.name}")
 
     def handle_bell_command(self) -> bytes:
         """
@@ -684,7 +680,7 @@ class CommProtocol:
         self.last_bell_time = current_time
         
         # Build response: identification string + CTRL_ETX
-        resp_ident = self.MODEL_BELL_STRINGS[self._model_name]
+        resp_ident = self._model.identification
 
         response = bytearray()
         response.extend(resp_ident.encode('ascii'))

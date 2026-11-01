@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict, field
 
+from machine_models import MachineModel, MODELS_BY_NAME, get_model
+
 logger = logging.getLogger(__name__)
 
 # ToDo: consider common get_pattern_stats() method that can be used by both MemorySlot and CardMemorySlot
@@ -1335,13 +1337,8 @@ class CardMemorySpace:
 class MachineState:
     """Manages the state of the sewing machine"""
 
-    # Model definitions: name -> (p_memory_total_size, num_slots)
-    MODELS = {
-        "PFAFF Creative 7570":    (40710, 30), # From real machine
-        "PFAFF Creative 7550":    (40710, 30), # From real machine
-        "PFAFF Creative 1475 CD": (6460, 16),  # From real machine
-        "PFAFF Creative 1475A":   (6460, 16),  # Guess
-    }
+    # Model definitions (names, identification strings and features) live in
+    # machine_models.py - see MACHINE_MODELS there.
 
     def __init__(self, model_name: str = None):
         self.p_memory_total_size = None
@@ -1354,26 +1351,33 @@ class MachineState:
         self.card_file_path: Optional[str] = None
         self.card_number: int = 1
         self._card_modified: bool = False
-        self.machine_model = None
-        
+        self.machine_model: Optional[str] = None
+        self._model: Optional[MachineModel] = None
+
         if model_name is not None:
             self.configure_model(model_name)
 
     def configure_model(self, model_name: str):
-        """Reconfigure machine parameters for the given model name."""
-        if model_name not in self.MODELS:
-            raise ValueError(f"Unknown model: {model_name}")
-        
+        """Reconfigure machine parameters for the given model name.
+
+        The model's feature set comes from machine_models.py; this method only
+        applies it to the live state (slot lists, sizes, card availability).
+        """
+        model = get_model(model_name)  # raises ValueError for unknown models
+
         current_model = self.machine_model
         is_current_1475 = current_model in ("PFAFF Creative 1475 CD", "PFAFF Creative 1475A")
         is_new_1475 = model_name in ("PFAFF Creative 1475 CD", "PFAFF Creative 1475A")
         if is_current_1475 != is_new_1475:
             logger.warning(f"Switching from {current_model} to {model_name} - resetting all P-Memory slots to Empty to avoid stale data issues.")
             self.p_memory_slots: List[MemorySlot] = []
-        
-        total_size, num_slots = self.MODELS[model_name]
-        self.machine_model = model_name
-        self.p_memory_total_size = total_size
+
+        self._model = model
+        self.machine_model = model.name
+        self.p_memory_total_size = model.p_memory_bytes
+
+        # P-Memory slots (a model without P-Memory has none)
+        num_slots = model.p_memory_slots or 0
         current = len(self.p_memory_slots)
         if num_slots > current:
             for i in range(current, num_slots):
@@ -1381,9 +1385,12 @@ class MachineState:
         elif num_slots < current:
             self.p_memory_slots = self.p_memory_slots[:num_slots]
 
-        # Initialize M-Memory slots (always 32, model-independent)
-        if not self.m_memory_slots:
-            self.init_m_memory_slots()
+        # M-Memory slots (32 for every model that has M-Memory)
+        if model.m_memory:
+            if not self.m_memory_slots:
+                self.init_m_memory_slots()
+        else:
+            self.m_memory_slots = []
     
     def get_p_memory_slot(self, slot_id: int) -> MemorySlot:
         """Get P-Memory slot by ID"""
@@ -1428,9 +1435,24 @@ class MachineState:
         return self._card_modified
 
     @property
+    def model(self) -> Optional[MachineModel]:
+        """The model definition of the configured machine (None if not configured)."""
+        return self._model
+
+    @property
     def supports_card(self) -> bool:
-        """True if the current machine model supports Memory Cards (only 7570)."""
-        return self.machine_model == "PFAFF Creative 7570"
+        """True if the current machine model supports Memory Cards."""
+        return bool(self._model and self._model.memory_cards)
+
+    @property
+    def supports_card_embroidery(self) -> bool:
+        """True if the current model supports the Embroidery card space."""
+        return bool(self._model and self._model.memory_cards and self._model.card_embroidery)
+
+    @property
+    def supports_card_p_muster(self) -> bool:
+        """True if the current model supports the P-Muster (9mm / MAXI) card spaces."""
+        return bool(self._model and self._model.memory_cards and self._model.card_p_muster)
 
     def mark_card_modified(self):
         """Mark the card state as modified (unsaved changes)."""
@@ -1546,7 +1568,7 @@ class MachineState:
         # Restore model first so slot count is correct before loading slots
         if "machine_model" in data:
             saved_model = data["machine_model"]
-            if saved_model in self.MODELS:
+            if saved_model in MODELS_BY_NAME:
                 self.configure_model(saved_model)
             else:
                 logger.warning(f"Unknown machine_model in saved state: {saved_model!r} - ignoring")
